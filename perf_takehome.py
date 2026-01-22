@@ -513,9 +513,6 @@ class KernelBuilder:
 
         vec_batches = batch_size // VLEN
         tail_start = vec_batches * VLEN
-        offset_consts = {
-            offset: self.scratch_const(offset) for offset in range(0, tail_start, VLEN)
-        }
         tail_const = self.scratch_const(tail_start)
 
         if self.enable_debug_ops:
@@ -534,16 +531,19 @@ class KernelBuilder:
 
         node_vecs = {}
         if vec_batches:
+            node_addr = self.alloc_scratch(length=1)
+            node_val = self.alloc_scratch(length=1)
+
             def load_node_vec(node_idx):
-                addr = self.alloc_scratch(length=1)
                 idx_const = self.scratch_const(node_idx)
                 self._emit(
                     "alu",
-                    ("+", addr, self.scratch["forest_values_p"], idx_const),
+                    ("+", node_addr, self.scratch["forest_values_p"], idx_const),
                 )
-                val_addr = self.alloc_scratch(length=1)
-                self._emit("load", ("load", val_addr, addr))
-                return self.vector_from_scalar(val_addr)
+                self._emit("load", ("load", node_val, node_addr))
+                node_vec = self.alloc_scratch(length=VLEN)
+                self._emit("valu", ("vbroadcast", node_vec, node_val))
+                return node_vec
 
             if forest_height >= 0:
                 node_vecs[0] = [load_node_vec(0)]
@@ -559,13 +559,12 @@ class KernelBuilder:
 
         if vec_batches:
             addr_val = self.alloc_temp(1)
+            self._emit(
+                "flow", ("add_imm", addr_val, self.scratch["inp_values_p"], 0)
+            )
             for block in vec_blocks:
-                i_const = offset_consts[block["offset"]]
-                self._emit(
-                    "alu",
-                    ("+", addr_val, self.scratch["inp_values_p"], i_const),
-                )
                 self._emit("load", ("vload", block["val"], addr_val))
+                self._emit("flow", ("add_imm", addr_val, addr_val, VLEN))
             self.free_temp(addr_val, 1)
 
         def alloc_vec_temps():
@@ -595,7 +594,7 @@ class KernelBuilder:
                     self._emit("alu", ("+", path_lane, path_lane, tmp_lane))
 
         if vec_batches:
-            unroll = min(27, vec_batches)
+            unroll = min(28, vec_batches)
             for round_idx in range(rounds):
                 depth = round_idx % (forest_height + 1)
                 reset_path = depth == forest_height
@@ -723,13 +722,12 @@ class KernelBuilder:
                         free_vec_temps(regs)
 
             addr_val = self.alloc_temp(1)
+            self._emit(
+                "flow", ("add_imm", addr_val, self.scratch["inp_values_p"], 0)
+            )
             for block in vec_blocks:
-                i_const = offset_consts[block["offset"]]
-                self._emit(
-                    "alu",
-                    ("+", addr_val, self.scratch["inp_values_p"], i_const),
-                )
                 self._emit("store", ("vstore", addr_val, block["val"]))
+                self._emit("flow", ("add_imm", addr_val, addr_val, VLEN))
             self.free_temp(addr_val, 1)
 
         tail = batch_size - tail_start
