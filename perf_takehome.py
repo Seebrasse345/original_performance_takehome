@@ -188,7 +188,7 @@ class Scheduler:
 
 
 class KernelBuilder:
-    def __init__(self):
+    def __init__(self, enable_debug_ops: bool = False):
         self.ops = []
         self.instrs = []
         self.scratch = {}
@@ -199,6 +199,9 @@ class KernelBuilder:
         self.mem_aliases = {}
         self.temp_alloc = None
         self.schedule_report = False
+        self.enable_debug_ops = enable_debug_ops
+        self.hash_vec_stages = []
+        self.hash_scalar_stages = []
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -376,9 +379,13 @@ class KernelBuilder:
         self.ops.append(Op(engine, slot, reads, writes, barrier=barrier))
 
     def emit_debug_compare(self, loc, key):
+        if not self.enable_debug_ops:
+            return
         self._emit("debug", ("compare", loc, key))
 
     def emit_debug_vcompare(self, loc, keys):
+        if not self.enable_debug_ops:
+            return
         self._emit("debug", ("vcompare", loc, keys))
 
     def _alloc_vec_regs(self):
@@ -399,19 +406,63 @@ class KernelBuilder:
         for key in ("addr_idx", "addr_val"):
             self.free_temp(regs[key], 1)
 
+    def _prepare_hash_stages(self):
+        self.hash_vec_stages = []
+        self.hash_scalar_stages = []
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            linear = op1 == "+" and op2 == "+" and op3 == "<<"
+            val1_addr = self.scratch_const(val1)
+            val3_addr = self.scratch_const(val3)
+            val1_vec = self.vector_const(val1)
+            val3_vec = self.vector_const(val3)
+            k_addr = None
+            k_vec = None
+            if linear:
+                k = 1 + (1 << val3)
+                k_addr = self.scratch_const(k)
+                k_vec = self.vector_const(k)
+            self.hash_scalar_stages.append(
+                {
+                    "linear": linear,
+                    "op1": op1,
+                    "op2": op2,
+                    "op3": op3,
+                    "val1": val1_addr,
+                    "val3": val3_addr,
+                    "k": k_addr,
+                }
+            )
+            self.hash_vec_stages.append(
+                {
+                    "linear": linear,
+                    "op1": op1,
+                    "op2": op2,
+                    "op3": op3,
+                    "val1": val1_vec,
+                    "val3": val3_vec,
+                    "k": k_vec,
+                }
+            )
+
     def build_hash_scalar(self, val_addr, tmp1, tmp2, round_idx, i):
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            self._emit("alu", (op1, tmp1, val_addr, self.scratch_const(val1)))
-            self._emit("alu", (op3, tmp2, val_addr, self.scratch_const(val3)))
-            self._emit("alu", (op2, val_addr, tmp1, tmp2))
+        for hi, stage in enumerate(self.hash_scalar_stages):
+            if stage["linear"]:
+                self._emit("alu", ("*", tmp1, val_addr, stage["k"]))
+                self._emit("alu", ("+", val_addr, tmp1, stage["val1"]))
+            else:
+                self._emit("alu", (stage["op1"], tmp1, val_addr, stage["val1"]))
+                self._emit("alu", (stage["op3"], tmp2, val_addr, stage["val3"]))
+                self._emit("alu", (stage["op2"], val_addr, tmp1, tmp2))
             self.emit_debug_compare(val_addr, (round_idx, i, "hash_stage", hi))
 
-    def build_hash_vector(self, val_vec, tmp1, tmp2, round_idx, base_i, vec_consts):
-        for hi, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
-            val1_vec, val3_vec = vec_consts[hi]
-            self._emit("valu", (op1, tmp1, val_vec, val1_vec))
-            self._emit("valu", (op3, tmp2, val_vec, val3_vec))
-            self._emit("valu", (op2, val_vec, tmp1, tmp2))
+    def build_hash_vector(self, val_vec, tmp1, tmp2, round_idx, base_i):
+        for hi, stage in enumerate(self.hash_vec_stages):
+            if stage["linear"]:
+                self._emit("valu", ("multiply_add", val_vec, val_vec, stage["k"], stage["val1"]))
+            else:
+                self._emit("valu", (stage["op1"], tmp1, val_vec, stage["val1"]))
+                self._emit("valu", (stage["op3"], tmp2, val_vec, stage["val3"]))
+                self._emit("valu", (stage["op2"], val_vec, tmp1, tmp2))
             keys = [(round_idx, base_i + lane, "hash_stage", hi) for lane in range(VLEN)]
             self.emit_debug_vcompare(val_vec, keys)
 
@@ -444,153 +495,233 @@ class KernelBuilder:
             self._emit("load", ("load", self.scratch[v], i_const))
 
         one_const = self.scratch_const(1)
-
-        for _, val1, _, _, val3 in HASH_STAGES:
-            self.scratch_const(val1)
-            self.scratch_const(val3)
+        self._prepare_hash_stages()
 
         one_vec = self.vector_const(1)
         n_nodes_vec = self.vector_from_scalar(self.scratch["n_nodes"])
         forest_base_vec = self.vector_from_scalar(self.scratch["forest_values_p"])
-
-        vec_const_pairs = []
-        for _, val1, _, _, val3 in HASH_STAGES:
-            vec_const_pairs.append((self.vector_const(val1), self.vector_const(val3)))
 
         vec_batches = batch_size // VLEN
         tail_start = vec_batches * VLEN
         offset_consts = {
             offset: self.scratch_const(offset) for offset in range(0, tail_start, VLEN)
         }
+        tail_const = self.scratch_const(tail_start)
 
         self._emit("flow", ("pause",), barrier=True)
 
-        def emit_vec_stage_a(regs_list, block_offsets, round_idx):
-            for regs, base_i in zip(regs_list, block_offsets):
-                i_const = offset_consts[base_i]
-                self._emit(
-                    "alu",
-                    ("+", regs["addr_idx"], self.scratch["inp_indices_p"], i_const),
-                )
-                self._emit(
-                    "load",
-                    ("vload", regs["idx"], regs["addr_idx"]),
-                    mem_alias="indices",
-                )
-                self.emit_debug_vcompare(
-                    regs["idx"],
-                    [(round_idx, base_i + lane, "idx") for lane in range(VLEN)],
-                )
-                self._emit(
-                    "alu",
-                    ("+", regs["addr_val"], self.scratch["inp_values_p"], i_const),
-                )
-                self._emit(
-                    "load",
-                    ("vload", regs["val"], regs["addr_val"]),
-                    mem_alias="values",
-                )
-                self.emit_debug_vcompare(
-                    regs["val"],
-                    [(round_idx, base_i + lane, "val") for lane in range(VLEN)],
-                )
-                self._emit(
-                    "valu",
-                    ("+", regs["addr"], regs["idx"], forest_base_vec),
-                )
-
-            for regs, base_i in zip(regs_list, block_offsets):
-                for offset in range(VLEN):
-                    self._emit(
-                        "load",
-                        ("load_offset", regs["node"], regs["addr"], offset),
-                        mem_alias="forest",
-                    )
-                self.emit_debug_vcompare(
-                    regs["node"],
-                    [(round_idx, base_i + lane, "node_val") for lane in range(VLEN)],
-                )
-
-        def emit_vec_stage_b(regs_list, block_offsets, round_idx):
-            for regs, base_i in zip(regs_list, block_offsets):
-                self._emit("valu", ("^", regs["val"], regs["val"], regs["node"]))
-                self.build_hash_vector(
-                    regs["val"],
-                    regs["tmp1"],
-                    regs["tmp2"],
-                    round_idx,
-                    base_i,
-                    vec_const_pairs,
-                )
-                self.emit_debug_vcompare(
-                    regs["val"],
-                    [(round_idx, base_i + lane, "hashed_val") for lane in range(VLEN)],
-                )
-                self._emit("valu", ("&", regs["tmp1"], regs["val"], one_vec))
-                self._emit("valu", ("+", regs["tmp1"], regs["tmp1"], one_vec))
-                self._emit("valu", ("<<", regs["tmp2"], regs["idx"], one_vec))
-                self._emit("valu", ("+", regs["idx"], regs["tmp2"], regs["tmp1"]))
-                self.emit_debug_vcompare(
-                    regs["idx"],
-                    [(round_idx, base_i + lane, "next_idx") for lane in range(VLEN)],
-                )
-                self._emit("valu", ("<", regs["tmp1"], regs["idx"], n_nodes_vec))
-                self._emit("valu", ("*", regs["idx"], regs["idx"], regs["tmp1"]))
-                self.emit_debug_vcompare(
-                    regs["idx"],
-                    [(round_idx, base_i + lane, "wrapped_idx") for lane in range(VLEN)],
-                )
-
-        def emit_vec_stage_c(regs_list):
-            for regs in regs_list:
-                self._emit(
-                    "store",
-                    ("vstore", regs["addr_idx"], regs["idx"]),
-                    mem_alias="indices",
-                )
-                self._emit(
-                    "store",
-                    ("vstore", regs["addr_val"], regs["val"]),
-                    mem_alias="values",
-                )
-
-        unroll = 4
+        vec_blocks = []
         if vec_batches:
-            for round_idx in range(rounds):
-                pipeline = []
-                for block_start in range(0, vec_batches, unroll):
-                    block_offsets = [
-                        offset
-                        for offset in range(
-                            block_start * VLEN,
-                            min(vec_batches, block_start + unroll) * VLEN,
-                            VLEN,
-                        )
-                    ]
-                    regs_list = [self._alloc_vec_regs() for _ in block_offsets]
-                    emit_vec_stage_a(regs_list, block_offsets, round_idx)
-                    pipeline.append((regs_list, block_offsets))
-                    if len(pipeline) >= 2:
-                        regs_b, offsets_b = pipeline[-2]
-                        emit_vec_stage_b(regs_b, offsets_b, round_idx)
-                    if len(pipeline) >= 3:
-                        regs_c, _ = pipeline[-3]
-                        emit_vec_stage_c(regs_c)
-                        for regs in regs_c:
-                            self._free_vec_regs(regs)
+            for offset in range(0, tail_start, VLEN):
+                vec_blocks.append(
+                    {
+                        "offset": offset,
+                        "addr_idx": self.alloc_scratch(length=1),
+                        "addr_val": self.alloc_scratch(length=1),
+                        "idx": self.alloc_scratch(length=VLEN),
+                        "val": self.alloc_scratch(length=VLEN),
+                    }
+                )
 
-                if pipeline:
-                    regs_b, offsets_b = pipeline[-1]
-                    emit_vec_stage_b(regs_b, offsets_b, round_idx)
-                    if len(pipeline) >= 2:
-                        regs_c, _ = pipeline[-2]
-                        emit_vec_stage_c(regs_c)
-                        for regs in regs_c:
-                            self._free_vec_regs(regs)
-                    regs_c, _ = pipeline[-1]
-                    emit_vec_stage_c(regs_c)
-                    for regs in regs_c:
-                        self._free_vec_regs(regs)
+            for block in vec_blocks:
+                i_const = offset_consts[block["offset"]]
+                self._emit(
+                    "alu",
+                    ("+", block["addr_idx"], self.scratch["inp_indices_p"], i_const),
+                )
+                self._emit(
+                    "alu",
+                    ("+", block["addr_val"], self.scratch["inp_values_p"], i_const),
+                )
+                self._emit("load", ("vload", block["idx"], block["addr_idx"]))
+                self._emit("load", ("vload", block["val"], block["addr_val"]))
+
+        node_vecs = {}
+        if vec_batches:
+            def load_node_vec(node_idx):
+                addr = self.alloc_scratch(length=1)
+                idx_const = self.scratch_const(node_idx)
+                self._emit(
+                    "alu",
+                    ("+", addr, self.scratch["forest_values_p"], idx_const),
+                )
+                val_addr = self.alloc_scratch(length=1)
+                self._emit("load", ("load", val_addr, addr))
+                return self.vector_from_scalar(val_addr)
+
+            if forest_height >= 0:
+                node_vecs[0] = [load_node_vec(0)]
+            if forest_height >= 1:
+                node_vecs[1] = [load_node_vec(1), load_node_vec(2)]
+            if forest_height >= 2:
+                node_vecs[2] = [
+                    load_node_vec(3),
+                    load_node_vec(4),
+                    load_node_vec(5),
+                    load_node_vec(6),
+                ]
+
+        def alloc_vec_temps():
+            return {
+                "addr": self.alloc_temp(VLEN),
+                "node": self.alloc_temp(VLEN),
+                "tmp1": self.alloc_temp(VLEN),
+                "tmp2": self.alloc_temp(VLEN),
+            }
+
+        def free_vec_temps(regs):
+            self.free_temp(regs["addr"], VLEN)
+            self.free_temp(regs["node"], VLEN)
+            self.free_temp(regs["tmp1"], VLEN)
+            self.free_temp(regs["tmp2"], VLEN)
+
+        def emit_vec_idx_update(regs):
+            self._emit("valu", ("&", regs["tmp1"], regs["val"], one_vec))
+            self._emit("valu", ("+", regs["tmp1"], regs["tmp1"], one_vec))
+            self._emit("valu", ("<<", regs["tmp2"], regs["idx"], one_vec))
+            self._emit("valu", ("+", regs["idx"], regs["tmp2"], regs["tmp1"]))
+            self._emit("valu", ("<", regs["tmp1"], regs["idx"], n_nodes_vec))
+            self._emit("valu", ("*", regs["idx"], regs["idx"], regs["tmp1"]))
+
+        if vec_batches:
+            unroll = min(16, vec_batches)
+            depth2_base_vec = self.vector_const(3)
+            for round_idx in range(rounds):
+                depth = round_idx % (forest_height + 1)
+                for block_start in range(0, vec_batches, unroll):
+                    block_group = vec_blocks[block_start : block_start + unroll]
+                    regs_list = []
+                    for block in block_group:
+                        temps = alloc_vec_temps()
+                        regs_list.append({**block, **temps})
+
+                    if depth == 0 and 0 in node_vecs:
+                        node0_vec = node_vecs[0][0]
+                        for regs in regs_list:
+                            self._emit(
+                                "valu", ("^", regs["val"], regs["val"], node0_vec)
+                            )
+                            self.build_hash_vector(
+                                regs["val"],
+                                regs["tmp1"],
+                                regs["tmp2"],
+                                round_idx,
+                                regs["offset"],
+                            )
+                            emit_vec_idx_update(regs)
+                    elif depth == 1 and 1 in node_vecs:
+                        node1_vec, node2_vec = node_vecs[1]
+                        for regs in regs_list:
+                            self._emit("valu", ("&", regs["tmp1"], regs["idx"], one_vec))
+                            self._emit(
+                                "flow",
+                                (
+                                    "vselect",
+                                    regs["node"],
+                                    regs["tmp1"],
+                                    node1_vec,
+                                    node2_vec,
+                                ),
+                            )
+                            self._emit(
+                                "valu", ("^", regs["val"], regs["val"], regs["node"])
+                            )
+                            self.build_hash_vector(
+                                regs["val"],
+                                regs["tmp1"],
+                                regs["tmp2"],
+                                round_idx,
+                                regs["offset"],
+                            )
+                            emit_vec_idx_update(regs)
+                    elif depth == 2 and 2 in node_vecs:
+                        node3_vec, node4_vec, node5_vec, node6_vec = node_vecs[2]
+                        for regs in regs_list:
+                            self._emit(
+                                "valu",
+                                ("-", regs["tmp1"], regs["idx"], depth2_base_vec),
+                            )
+                            self._emit(
+                                "valu", ("&", regs["tmp2"], regs["tmp1"], one_vec)
+                            )
+                            self._emit(
+                                "valu", (">>", regs["tmp1"], regs["tmp1"], one_vec)
+                            )
+                            self._emit(
+                                "valu", ("&", regs["tmp1"], regs["tmp1"], one_vec)
+                            )
+                            self._emit(
+                                "flow",
+                                (
+                                    "vselect",
+                                    regs["node"],
+                                    regs["tmp2"],
+                                    node4_vec,
+                                    node3_vec,
+                                ),
+                            )
+                            self._emit(
+                                "flow",
+                                (
+                                    "vselect",
+                                    regs["addr"],
+                                    regs["tmp2"],
+                                    node6_vec,
+                                    node5_vec,
+                                ),
+                            )
+                            self._emit(
+                                "flow",
+                                (
+                                    "vselect",
+                                    regs["node"],
+                                    regs["tmp1"],
+                                    regs["addr"],
+                                    regs["node"],
+                                ),
+                            )
+                            self._emit(
+                                "valu", ("^", regs["val"], regs["val"], regs["node"])
+                            )
+                            self.build_hash_vector(
+                                regs["val"],
+                                regs["tmp1"],
+                                regs["tmp2"],
+                                round_idx,
+                                regs["offset"],
+                            )
+                            emit_vec_idx_update(regs)
+                    else:
+                        for regs in regs_list:
+                            self._emit(
+                                "valu",
+                                ("+", regs["addr"], regs["idx"], forest_base_vec),
+                            )
+                        for regs in regs_list:
+                            for offset in range(VLEN):
+                                self._emit(
+                                    "load",
+                                    ("load_offset", regs["node"], regs["addr"], offset),
+                                )
+                        for regs in regs_list:
+                            self._emit(
+                                "valu", ("^", regs["val"], regs["val"], regs["node"])
+                            )
+                            self.build_hash_vector(
+                                regs["val"],
+                                regs["tmp1"],
+                                regs["tmp2"],
+                                round_idx,
+                                regs["offset"],
+                            )
+                            emit_vec_idx_update(regs)
+
+                    for regs in regs_list:
+                        free_vec_temps(regs)
+
+            for block in vec_blocks:
+                self._emit("store", ("vstore", block["addr_idx"], block["idx"]))
+                self._emit("store", ("vstore", block["addr_val"], block["val"]))
 
         tail = batch_size - tail_start
         if tail:
@@ -603,66 +734,38 @@ class KernelBuilder:
             tmp1 = self.alloc_temp(1)
             tmp2 = self.alloc_temp(1)
 
-            tail_const = self.scratch_const(tail_start)
+            self._emit(
+                "alu",
+                ("+", addr_idx, self.scratch["inp_indices_p"], tail_const),
+            )
+            self._emit(
+                "alu",
+                ("+", addr_val, self.scratch["inp_values_p"], tail_const),
+            )
+            for offset in range(tail):
+                i = tail_start + offset
+                self._emit("load", ("load", tmp_idx, addr_idx))
+                self._emit("load", ("load", tmp_val, addr_val))
 
-            for round_idx in range(rounds):
-                self._emit(
-                    "alu",
-                    ("+", addr_idx, self.scratch["inp_indices_p"], tail_const),
-                )
-                self._emit(
-                    "alu",
-                    ("+", addr_val, self.scratch["inp_values_p"], tail_const),
-                )
-                for offset in range(tail):
-                    i = tail_start + offset
-                    self._emit(
-                        "load",
-                        ("load", tmp_idx, addr_idx),
-                        mem_alias="indices",
-                    )
-                    self.emit_debug_compare(tmp_idx, (round_idx, i, "idx"))
-                    self._emit(
-                        "load",
-                        ("load", tmp_val, addr_val),
-                        mem_alias="values",
-                    )
-                    self.emit_debug_compare(tmp_val, (round_idx, i, "val"))
+                for round_idx in range(rounds):
                     self._emit(
                         "alu",
                         ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx),
                     )
-                    self._emit(
-                        "load",
-                        ("load", tmp_node, tmp_addr),
-                        mem_alias="forest",
-                    )
-                    self.emit_debug_compare(tmp_node, (round_idx, i, "node_val"))
+                    self._emit("load", ("load", tmp_node, tmp_addr))
                     self._emit("alu", ("^", tmp_val, tmp_val, tmp_node))
                     self.build_hash_scalar(tmp_val, tmp1, tmp2, round_idx, i)
-                    self.emit_debug_compare(tmp_val, (round_idx, i, "hashed_val"))
-
                     self._emit("alu", ("&", tmp1, tmp_val, one_const))
                     self._emit("alu", ("+", tmp1, tmp1, one_const))
                     self._emit("alu", ("<<", tmp2, tmp_idx, one_const))
                     self._emit("alu", ("+", tmp_idx, tmp2, tmp1))
-                    self.emit_debug_compare(tmp_idx, (round_idx, i, "next_idx"))
                     self._emit("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"]))
                     self._emit("alu", ("*", tmp_idx, tmp_idx, tmp1))
-                    self.emit_debug_compare(tmp_idx, (round_idx, i, "wrapped_idx"))
 
-                    self._emit(
-                        "store",
-                        ("store", addr_idx, tmp_idx),
-                        mem_alias="indices",
-                    )
-                    self._emit(
-                        "store",
-                        ("store", addr_val, tmp_val),
-                        mem_alias="values",
-                    )
-                    self._emit("alu", ("+", addr_idx, addr_idx, one_const))
-                    self._emit("alu", ("+", addr_val, addr_val, one_const))
+                self._emit("store", ("store", addr_idx, tmp_idx))
+                self._emit("store", ("store", addr_val, tmp_val))
+                self._emit("alu", ("+", addr_idx, addr_idx, one_const))
+                self._emit("alu", ("+", addr_val, addr_val, one_const))
 
             self.free_temp(addr_idx, 1)
             self.free_temp(addr_val, 1)
