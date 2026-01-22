@@ -501,7 +501,6 @@ class KernelBuilder:
         self._prepare_hash_stages()
 
         one_vec = self.vector_const(1)
-        two_vec = self.vector_const(2)
         forest_base_vec = self.vector_from_scalar(self.scratch["forest_values_p"])
 
         depth_addr_vecs = {}
@@ -581,15 +580,19 @@ class KernelBuilder:
             self.free_temp(regs["node"], VLEN)
             self.free_temp(regs["tmp"], VLEN)
 
-        def emit_vec_path_update(regs, reset=False):
-            if reset:
-                self._emit("valu", ("^", regs["path"], regs["path"], regs["path"]))
-                return
-            self._emit("valu", ("&", regs["tmp"], regs["val"], one_vec))
-            self._emit(
-                "valu",
-                ("multiply_add", regs["path"], regs["path"], two_vec, regs["tmp"]),
-            )
+        def emit_vec_path_update(regs, reset=False, depth0=False):
+            for lane in range(VLEN):
+                path_lane = regs["path"] + lane
+                val_lane = regs["val"] + lane
+                tmp_lane = regs["tmp"] + lane
+                if reset:
+                    self._emit("alu", ("^", path_lane, path_lane, path_lane))
+                elif depth0:
+                    self._emit("alu", ("&", path_lane, val_lane, one_const))
+                else:
+                    self._emit("alu", ("&", tmp_lane, val_lane, one_const))
+                    self._emit("alu", ("<<", path_lane, path_lane, one_const))
+                    self._emit("alu", ("+", path_lane, path_lane, tmp_lane))
 
         if vec_batches:
             unroll = min(26, vec_batches)
@@ -616,13 +619,7 @@ class KernelBuilder:
                                 round_idx,
                                 regs["offset"],
                             )
-                            if reset_path:
-                                emit_vec_path_update(regs, True)
-                            else:
-                                self._emit(
-                                    "valu",
-                                    ("&", regs["path"], regs["val"], one_vec),
-                                )
+                            emit_vec_path_update(regs, reset_path, depth0=True)
                     elif depth == 1 and 1 in node_vecs:
                         node1_vec, node2_vec = node_vecs[1]
                         for regs in regs_list:
