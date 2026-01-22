@@ -504,17 +504,13 @@ class KernelBuilder:
         two_vec = self.vector_const(2)
         forest_base_vec = self.vector_from_scalar(self.scratch["forest_values_p"])
 
-        depth_base_vecs = []
-        depth_addr_vecs = []
-        for depth in range(forest_height + 1):
+        depth_addr_vecs = {}
+        for depth in range(3, forest_height + 1):
             base = (1 << depth) - 1
             base_vec = self.vector_const(base)
-            depth_base_vecs.append(base_vec)
             addr_vec = self.alloc_scratch(length=VLEN)
             self._emit("valu", ("+", addr_vec, forest_base_vec, base_vec))
-            depth_addr_vecs.append(addr_vec)
-        end_depth = (rounds - 1) % (forest_height + 1)
-        end_base_vec = depth_base_vecs[end_depth]
+            depth_addr_vecs[depth] = addr_vec
 
         vec_batches = batch_size // VLEN
         tail_start = vec_batches * VLEN
@@ -523,7 +519,8 @@ class KernelBuilder:
         }
         tail_const = self.scratch_const(tail_start)
 
-        self._emit("flow", ("pause",), barrier=True)
+        if self.enable_debug_ops:
+            self._emit("flow", ("pause",), barrier=True)
 
         vec_blocks = []
         if vec_batches:
@@ -595,7 +592,7 @@ class KernelBuilder:
             )
 
         if vec_batches:
-            unroll = min(25, vec_batches)
+            unroll = min(26, vec_batches)
             for round_idx in range(rounds):
                 depth = round_idx % (forest_height + 1)
                 reset_path = depth == forest_height
@@ -619,19 +616,22 @@ class KernelBuilder:
                                 round_idx,
                                 regs["offset"],
                             )
-                            emit_vec_path_update(regs, reset_path)
+                            if reset_path:
+                                emit_vec_path_update(regs, True)
+                            else:
+                                self._emit(
+                                    "valu",
+                                    ("&", regs["path"], regs["val"], one_vec),
+                                )
                     elif depth == 1 and 1 in node_vecs:
                         node1_vec, node2_vec = node_vecs[1]
                         for regs in regs_list:
-                            self._emit(
-                                "valu", ("&", regs["tmp"], regs["path"], one_vec)
-                            )
                             self._emit(
                                 "flow",
                                 (
                                     "vselect",
                                     regs["node"],
-                                    regs["tmp"],
+                                    regs["path"],
                                     node2_vec,
                                     node1_vec,
                                 ),
@@ -725,26 +725,14 @@ class KernelBuilder:
                     for regs in regs_list:
                         free_vec_temps(regs)
 
-            addr_idx = self.alloc_temp(1)
             addr_val = self.alloc_temp(1)
             for block in vec_blocks:
                 i_const = offset_consts[block["offset"]]
                 self._emit(
                     "alu",
-                    ("+", addr_idx, self.scratch["inp_indices_p"], i_const),
-                )
-                self._emit(
-                    "alu",
                     ("+", addr_val, self.scratch["inp_values_p"], i_const),
                 )
-                if end_depth:
-                    self._emit(
-                        "valu",
-                        ("+", block["path"], block["path"], end_base_vec),
-                    )
-                self._emit("store", ("vstore", addr_idx, block["path"]))
                 self._emit("store", ("vstore", addr_val, block["val"]))
-            self.free_temp(addr_idx, 1)
             self.free_temp(addr_val, 1)
 
         tail = batch_size - tail_start
@@ -800,7 +788,8 @@ class KernelBuilder:
             self.free_temp(tmp1, 1)
             self.free_temp(tmp2, 1)
 
-        self._emit("flow", ("pause",), barrier=True)
+        if self.enable_debug_ops:
+            self._emit("flow", ("pause",), barrier=True)
         scheduler = Scheduler(SLOT_LIMITS)
         self.instrs = scheduler.schedule(self.ops, report=self.schedule_report)
 
@@ -820,7 +809,7 @@ def do_kernel_test(
     inp = Input.generate(forest, batch_size, rounds)
     mem = build_mem_image(forest, inp)
 
-    kb = KernelBuilder()
+    kb = KernelBuilder(enable_debug_ops=True)
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
 
