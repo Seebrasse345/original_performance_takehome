@@ -502,8 +502,19 @@ class KernelBuilder:
 
         one_vec = self.vector_const(1)
         two_vec = self.vector_const(2)
-        n_nodes_vec = self.vector_from_scalar(self.scratch["n_nodes"])
         forest_base_vec = self.vector_from_scalar(self.scratch["forest_values_p"])
+
+        depth_base_vecs = []
+        depth_addr_vecs = []
+        for depth in range(forest_height + 1):
+            base = (1 << depth) - 1
+            base_vec = self.vector_const(base)
+            depth_base_vecs.append(base_vec)
+            addr_vec = self.alloc_scratch(length=VLEN)
+            self._emit("valu", ("+", addr_vec, forest_base_vec, base_vec))
+            depth_addr_vecs.append(addr_vec)
+        end_depth = (rounds - 1) % (forest_height + 1)
+        end_base_vec = depth_base_vecs[end_depth]
 
         vec_batches = batch_size // VLEN
         tail_start = vec_batches * VLEN
@@ -520,7 +531,7 @@ class KernelBuilder:
                 vec_blocks.append(
                     {
                         "offset": offset,
-                        "idx": self.alloc_scratch(length=VLEN),
+                        "path": self.alloc_scratch(length=VLEN),
                         "val": self.alloc_scratch(length=VLEN),
                     }
                 )
@@ -551,22 +562,14 @@ class KernelBuilder:
                 ]
 
         if vec_batches:
-            depth2_base_vec = self.vector_const(3)
-            addr_idx = self.alloc_temp(1)
             addr_val = self.alloc_temp(1)
             for block in vec_blocks:
                 i_const = offset_consts[block["offset"]]
                 self._emit(
                     "alu",
-                    ("+", addr_idx, self.scratch["inp_indices_p"], i_const),
-                )
-                self._emit(
-                    "alu",
                     ("+", addr_val, self.scratch["inp_values_p"], i_const),
                 )
-                self._emit("load", ("vload", block["idx"], addr_idx))
                 self._emit("load", ("vload", block["val"], addr_val))
-            self.free_temp(addr_idx, 1)
             self.free_temp(addr_val, 1)
 
         def alloc_vec_temps():
@@ -581,20 +584,21 @@ class KernelBuilder:
             self.free_temp(regs["node"], VLEN)
             self.free_temp(regs["tmp"], VLEN)
 
-        def emit_vec_idx_update(regs):
+        def emit_vec_path_update(regs, reset=False):
+            if reset:
+                self._emit("valu", ("^", regs["path"], regs["path"], regs["path"]))
+                return
             self._emit("valu", ("&", regs["tmp"], regs["val"], one_vec))
-            self._emit("valu", ("+", regs["tmp"], regs["tmp"], one_vec))
             self._emit(
                 "valu",
-                ("multiply_add", regs["idx"], regs["idx"], two_vec, regs["tmp"]),
+                ("multiply_add", regs["path"], regs["path"], two_vec, regs["tmp"]),
             )
-            self._emit("valu", ("<", regs["tmp"], regs["idx"], n_nodes_vec))
-            self._emit("valu", ("*", regs["idx"], regs["idx"], regs["tmp"]))
 
         if vec_batches:
-            unroll = vec_batches
+            unroll = min(25, vec_batches)
             for round_idx in range(rounds):
                 depth = round_idx % (forest_height + 1)
+                reset_path = depth == forest_height
                 for block_start in range(0, vec_batches, unroll):
                     block_group = vec_blocks[block_start : block_start + unroll]
                     regs_list = []
@@ -615,19 +619,21 @@ class KernelBuilder:
                                 round_idx,
                                 regs["offset"],
                             )
-                            emit_vec_idx_update(regs)
+                            emit_vec_path_update(regs, reset_path)
                     elif depth == 1 and 1 in node_vecs:
                         node1_vec, node2_vec = node_vecs[1]
                         for regs in regs_list:
-                            self._emit("valu", ("&", regs["tmp"], regs["idx"], one_vec))
+                            self._emit(
+                                "valu", ("&", regs["tmp"], regs["path"], one_vec)
+                            )
                             self._emit(
                                 "flow",
                                 (
                                     "vselect",
                                     regs["node"],
                                     regs["tmp"],
-                                    node1_vec,
                                     node2_vec,
+                                    node1_vec,
                                 ),
                             )
                             self._emit(
@@ -640,19 +646,15 @@ class KernelBuilder:
                                 round_idx,
                                 regs["offset"],
                             )
-                            emit_vec_idx_update(regs)
+                            emit_vec_path_update(regs, reset_path)
                     elif depth == 2 and 2 in node_vecs:
                         node3_vec, node4_vec, node5_vec, node6_vec = node_vecs[2]
                         for regs in regs_list:
                             self._emit(
-                                "valu",
-                                ("-", regs["tmp"], regs["idx"], depth2_base_vec),
+                                "valu", ("&", regs["addr"], regs["path"], one_vec)
                             )
                             self._emit(
-                                "valu", ("&", regs["addr"], regs["tmp"], one_vec)
-                            )
-                            self._emit(
-                                "valu", (">>", regs["tmp"], regs["tmp"], one_vec)
+                                "valu", (">>", regs["tmp"], regs["path"], one_vec)
                             )
                             self._emit(
                                 "flow",
@@ -694,12 +696,12 @@ class KernelBuilder:
                                 round_idx,
                                 regs["offset"],
                             )
-                            emit_vec_idx_update(regs)
+                            emit_vec_path_update(regs, reset_path)
                     else:
                         for regs in regs_list:
                             self._emit(
                                 "valu",
-                                ("+", regs["addr"], regs["idx"], forest_base_vec),
+                                ("+", regs["addr"], regs["path"], depth_addr_vecs[depth]),
                             )
                         for regs in regs_list:
                             for offset in range(VLEN):
@@ -718,7 +720,7 @@ class KernelBuilder:
                                 round_idx,
                                 regs["offset"],
                             )
-                            emit_vec_idx_update(regs)
+                            emit_vec_path_update(regs, reset_path)
 
                     for regs in regs_list:
                         free_vec_temps(regs)
@@ -735,7 +737,12 @@ class KernelBuilder:
                     "alu",
                     ("+", addr_val, self.scratch["inp_values_p"], i_const),
                 )
-                self._emit("store", ("vstore", addr_idx, block["idx"]))
+                if end_depth:
+                    self._emit(
+                        "valu",
+                        ("+", block["path"], block["path"], end_base_vec),
+                    )
+                self._emit("store", ("vstore", addr_idx, block["path"]))
                 self._emit("store", ("vstore", addr_val, block["val"]))
             self.free_temp(addr_idx, 1)
             self.free_temp(addr_val, 1)
