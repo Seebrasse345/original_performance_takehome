@@ -573,25 +573,23 @@ class KernelBuilder:
             return {
                 "addr": self.alloc_temp(VLEN),
                 "node": self.alloc_temp(VLEN),
-                "tmp1": self.alloc_temp(VLEN),
-                "tmp2": self.alloc_temp(VLEN),
+                "tmp": self.alloc_temp(VLEN),
             }
 
         def free_vec_temps(regs):
             self.free_temp(regs["addr"], VLEN)
             self.free_temp(regs["node"], VLEN)
-            self.free_temp(regs["tmp1"], VLEN)
-            self.free_temp(regs["tmp2"], VLEN)
+            self.free_temp(regs["tmp"], VLEN)
 
         def emit_vec_idx_update(regs):
-            self._emit("valu", ("&", regs["tmp1"], regs["val"], one_vec))
-            self._emit("valu", ("+", regs["tmp1"], regs["tmp1"], one_vec))
+            self._emit("valu", ("&", regs["tmp"], regs["val"], one_vec))
+            self._emit("valu", ("+", regs["tmp"], regs["tmp"], one_vec))
             self._emit(
                 "valu",
-                ("multiply_add", regs["idx"], regs["idx"], two_vec, regs["tmp1"]),
+                ("multiply_add", regs["idx"], regs["idx"], two_vec, regs["tmp"]),
             )
-            self._emit("valu", ("<", regs["tmp1"], regs["idx"], n_nodes_vec))
-            self._emit("valu", ("*", regs["idx"], regs["idx"], regs["tmp1"]))
+            self._emit("valu", ("<", regs["tmp"], regs["idx"], n_nodes_vec))
+            self._emit("valu", ("*", regs["idx"], regs["idx"], regs["tmp"]))
 
         if vec_batches:
             unroll = min(24, vec_batches)
