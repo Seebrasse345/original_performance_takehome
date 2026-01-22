@@ -592,7 +592,7 @@ class KernelBuilder:
             self._emit("valu", ("*", regs["idx"], regs["idx"], regs["tmp"]))
 
         if vec_batches:
-            unroll = min(24, vec_batches)
+            unroll = vec_batches
             for round_idx in range(rounds):
                 depth = round_idx % (forest_height + 1)
                 for block_start in range(0, vec_batches, unroll):
@@ -610,8 +610,8 @@ class KernelBuilder:
                             )
                             self.build_hash_vector(
                                 regs["val"],
-                                regs["tmp1"],
-                                regs["tmp2"],
+                                regs["tmp"],
+                                regs["node"],
                                 round_idx,
                                 regs["offset"],
                             )
@@ -619,13 +619,13 @@ class KernelBuilder:
                     elif depth == 1 and 1 in node_vecs:
                         node1_vec, node2_vec = node_vecs[1]
                         for regs in regs_list:
-                            self._emit("valu", ("&", regs["tmp1"], regs["idx"], one_vec))
+                            self._emit("valu", ("&", regs["tmp"], regs["idx"], one_vec))
                             self._emit(
                                 "flow",
                                 (
                                     "vselect",
                                     regs["node"],
-                                    regs["tmp1"],
+                                    regs["tmp"],
                                     node1_vec,
                                     node2_vec,
                                 ),
@@ -635,8 +635,8 @@ class KernelBuilder:
                             )
                             self.build_hash_vector(
                                 regs["val"],
-                                regs["tmp1"],
-                                regs["tmp2"],
+                                regs["tmp"],
+                                regs["node"],
                                 round_idx,
                                 regs["offset"],
                             )
@@ -646,20 +646,20 @@ class KernelBuilder:
                         for regs in regs_list:
                             self._emit(
                                 "valu",
-                                ("-", regs["tmp1"], regs["idx"], depth2_base_vec),
+                                ("-", regs["tmp"], regs["idx"], depth2_base_vec),
                             )
                             self._emit(
-                                "valu", ("&", regs["tmp2"], regs["tmp1"], one_vec)
+                                "valu", ("&", regs["addr"], regs["tmp"], one_vec)
                             )
                             self._emit(
-                                "valu", (">>", regs["tmp1"], regs["tmp1"], one_vec)
+                                "valu", (">>", regs["tmp"], regs["tmp"], one_vec)
                             )
                             self._emit(
                                 "flow",
                                 (
                                     "vselect",
                                     regs["node"],
-                                    regs["tmp2"],
+                                    regs["addr"],
                                     node4_vec,
                                     node3_vec,
                                 ),
@@ -669,7 +669,7 @@ class KernelBuilder:
                                 (
                                     "vselect",
                                     regs["addr"],
-                                    regs["tmp2"],
+                                    regs["addr"],
                                     node6_vec,
                                     node5_vec,
                                 ),
@@ -679,7 +679,7 @@ class KernelBuilder:
                                 (
                                     "vselect",
                                     regs["node"],
-                                    regs["tmp1"],
+                                    regs["tmp"],
                                     regs["addr"],
                                     regs["node"],
                                 ),
@@ -689,8 +689,8 @@ class KernelBuilder:
                             )
                             self.build_hash_vector(
                                 regs["val"],
-                                regs["tmp1"],
-                                regs["tmp2"],
+                                regs["tmp"],
+                                regs["node"],
                                 round_idx,
                                 regs["offset"],
                             )
@@ -713,8 +713,8 @@ class KernelBuilder:
                             )
                             self.build_hash_vector(
                                 regs["val"],
-                                regs["tmp1"],
-                                regs["tmp2"],
+                                regs["tmp"],
+                                regs["node"],
                                 round_idx,
                                 regs["offset"],
                             )
