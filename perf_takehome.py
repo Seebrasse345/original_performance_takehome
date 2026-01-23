@@ -571,6 +571,21 @@ class KernelBuilder:
 
         one_vec = self.vector_const(1)
 
+        # Inline J-lane parallel hashing function
+        def do_hash_vector_jlane(regs_list):
+            """Process same hash stage across multiple blocks for latency hiding."""
+            for stage in self.hash_vec_stages:
+                if stage["linear"]:
+                    for regs in regs_list:
+                        self._emit("valu", ("multiply_add", regs["val"], regs["val"], stage["k"], stage["val1"]))
+                else:
+                    for regs in regs_list:
+                        self._emit("valu", (stage["op1"], regs["tmp"], regs["val"], stage["val1"]))
+                    for regs in regs_list:
+                        self._emit("valu", (stage["op3"], regs["node"], regs["val"], stage["val3"]))
+                    for regs in regs_list:
+                        self._emit("valu", (stage["op2"], regs["val"], regs["tmp"], regs["node"]))
+
         depth_addr_scalars = {}
         for depth in range(3, forest_height + 1):
             base = (1 << depth) - 1
@@ -688,7 +703,7 @@ class KernelBuilder:
                         for regs in regs_list:
                             self._emit("valu", ("^", regs["val"], regs["val"], node0_vec))
                         # J-lane parallel hash across all blocks
-                        self.build_hash_vector_jlane(regs_list, round_idx)
+                        do_hash_vector_jlane(regs_list)
                         # Path update for all blocks
                         for regs in regs_list:
                             emit_vec_path_update(regs, reset_path, depth0=True)
@@ -700,7 +715,7 @@ class KernelBuilder:
                             self._emit("flow", ("vselect", regs["node"], regs["path"], node2_vec, node1_vec))
                         for regs in regs_list:
                             self._emit("valu", ("^", regs["val"], regs["val"], regs["node"]))
-                        self.build_hash_vector_jlane(regs_list, round_idx)
+                        do_hash_vector_jlane(regs_list)
                         for regs in regs_list:
                             emit_vec_path_update(regs, reset_path)
 
@@ -724,7 +739,7 @@ class KernelBuilder:
                         for regs in regs_list:
                             self._emit("valu", ("^", regs["val"], regs["val"], regs["node"]))
                         # J-lane hash
-                        self.build_hash_vector_jlane(regs_list, round_idx)
+                        do_hash_vector_jlane(regs_list)
                         # Path update
                         for regs in regs_list:
                             emit_vec_path_update(regs, reset_path)
@@ -772,7 +787,7 @@ class KernelBuilder:
                             self._emit("valu", ("^", regs["val"], regs["val"], regs["node"]))
 
                         # J-lane hash across all blocks
-                        self.build_hash_vector_jlane(regs_list, round_idx)
+                        do_hash_vector_jlane(regs_list)
 
                         # Path update for all blocks
                         for regs in regs_list:
@@ -803,7 +818,7 @@ class KernelBuilder:
                                 "valu", ("^", regs["val"], regs["val"], regs["node"])
                             )
                         # J-lane hash across all blocks
-                        self.build_hash_vector_jlane(regs_list, round_idx)
+                        do_hash_vector_jlane(regs_list)
                         # Path update for all blocks
                         for regs in regs_list:
                             emit_vec_path_update(regs, reset_path)
