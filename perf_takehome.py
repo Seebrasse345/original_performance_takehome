@@ -501,15 +501,17 @@ class KernelBuilder:
         self._prepare_hash_stages()
 
         one_vec = self.vector_const(1)
-        forest_base_vec = self.vector_from_scalar(self.scratch["forest_values_p"])
 
-        depth_addr_vecs = {}
+        depth_addr_scalars = {}
         for depth in range(3, forest_height + 1):
             base = (1 << depth) - 1
-            base_vec = self.vector_const(base)
-            addr_vec = self.alloc_scratch(length=VLEN)
-            self._emit("valu", ("+", addr_vec, forest_base_vec, base_vec))
-            depth_addr_vecs[depth] = addr_vec
+            base_const = self.scratch_const(base)
+            addr_scalar = self.alloc_scratch(length=1)
+            self._emit(
+                "alu",
+                ("+", addr_scalar, self.scratch["forest_values_p"], base_const),
+            )
+            depth_addr_scalars[depth] = addr_scalar
 
         vec_batches = batch_size // VLEN
         tail_start = vec_batches * VLEN
@@ -695,10 +697,17 @@ class KernelBuilder:
                             emit_vec_path_update(regs, reset_path)
                     else:
                         for regs in regs_list:
-                            self._emit(
-                                "valu",
-                                ("+", regs["addr"], regs["path"], depth_addr_vecs[depth]),
-                            )
+                            depth_addr = depth_addr_scalars[depth]
+                            for lane in range(VLEN):
+                                self._emit(
+                                    "alu",
+                                    (
+                                        "+",
+                                        regs["addr"] + lane,
+                                        regs["path"] + lane,
+                                        depth_addr,
+                                    ),
+                                )
                         for regs in regs_list:
                             for offset in range(VLEN):
                                 self._emit(
