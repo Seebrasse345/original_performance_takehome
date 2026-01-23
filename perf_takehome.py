@@ -762,34 +762,34 @@ class KernelBuilder:
 
                     elif depth == 3 and 3 in node_vecs:
                         # Depth 3: 8-way selection using shared temps
-                        # This saves 512 loads by preloading nodes 7-14
-                        # Uses 7 vselects per block instead of 8 gather loads
+                        # Saves 512 loads by preloading nodes 7-14
                         nodes8 = node_vecs[3]
 
-                        # Allocate shared temps for 8-way selection (once for all blocks)
+                        # Allocate shared temps for 8-way selection
                         bit_temps = [self.alloc_temp(VLEN) for _ in range(3)]
                         sel_temps = [self.alloc_temp(VLEN) for _ in range(4)]
 
-                        # Process blocks sequentially with shared temps
+                        # Phase 1: 8-way select for all blocks (sequential due to shared temps)
                         for regs in regs_list:
-                            # 8-way select: choose node based on 3-bit path
                             self.emit_select_8way(
                                 regs["node"], regs["path"], nodes8,
                                 one_vec, two_vec, bit_temps, sel_temps
                             )
-                            # XOR with selected node
-                            self._emit("valu", ("^", regs["val"], regs["val"], regs["node"]))
-                            # Hash
-                            self.build_hash_vector(
-                                regs["val"], regs["tmp"], regs["node"],
-                                round_idx, regs["offset"]
-                            )
-                            # Path update
-                            emit_vec_path_update(regs, reset_path)
 
-                        # Free shared temps
+                        # Free shared temps early to reduce pressure
                         for t in bit_temps + sel_temps:
                             self.free_temp(t, VLEN)
+
+                        # Phase 2: XOR for all blocks (interleaved)
+                        for regs in regs_list:
+                            self._emit("valu", ("^", regs["val"], regs["val"], regs["node"]))
+
+                        # Phase 3: J-lane hash across all blocks
+                        self.build_hash_vector_jlane(regs_list, round_idx)
+
+                        # Phase 4: Path update for all blocks
+                        for regs in regs_list:
+                            emit_vec_path_update(regs, reset_path)
 
                     else:
                         for regs in regs_list:
