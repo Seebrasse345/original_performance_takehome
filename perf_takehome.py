@@ -133,7 +133,7 @@ class Scheduler:
             cycle_writes = set()
             scheduled = []
 
-            # SLIL-aware sorting: prioritize by height, then by minimizing live interval extension
+            # Load-aware SLIL scheduling with address prefetch prioritization
             def slil_priority(idx):
                 op = ops[idx]
                 height_score = -heights[idx]
@@ -538,6 +538,37 @@ class KernelBuilder:
                 for regs in regs_list:
                     self._emit("valu", (stage["op2"], regs["val"], regs["tmp"], regs["node"]))
 
+    def emit_select_8way(self, dest, path, nodes8, one_vec, two_vec, bit_temps, sel_temps):
+        """
+        Select one of 8 node values based on 3-bit path using 7 vselects.
+        Uses shared temps across blocks for efficiency.
+        nodes8: list of 8 broadcast vectors [n0, n1, n2, n3, n4, n5, n6, n7]
+        bit_temps: [bit0, bit1, bit2] - temps for extracted bits
+        sel_temps: [sel_a, sel_b, sel_c, sel_d] - temps for selection tree
+        """
+        bit0, bit1, bit2 = bit_temps
+        sel_a, sel_b, sel_c, sel_d = sel_temps
+
+        # Extract 3 bits from path
+        self._emit("valu", ("&", bit0, path, one_vec))            # bit0 = path & 1
+        self._emit("valu", (">>", bit1, path, one_vec))
+        self._emit("valu", ("&", bit1, bit1, one_vec))            # bit1 = (path >> 1) & 1
+        self._emit("valu", (">>", bit2, path, two_vec))
+        self._emit("valu", ("&", bit2, bit2, one_vec))            # bit2 = (path >> 2) & 1
+
+        # Level 1: Select pairs based on bit0 (4 vselects)
+        self._emit("flow", ("vselect", sel_a, bit0, nodes8[1], nodes8[0]))
+        self._emit("flow", ("vselect", sel_b, bit0, nodes8[3], nodes8[2]))
+        self._emit("flow", ("vselect", sel_c, bit0, nodes8[5], nodes8[4]))
+        self._emit("flow", ("vselect", sel_d, bit0, nodes8[7], nodes8[6]))
+
+        # Level 2: Select based on bit1 (2 vselects)
+        self._emit("flow", ("vselect", sel_a, bit1, sel_b, sel_a))
+        self._emit("flow", ("vselect", sel_c, bit1, sel_d, sel_c))
+
+        # Level 3: Select based on bit2 (1 vselect)
+        self._emit("flow", ("vselect", dest, bit2, sel_c, sel_a))
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -627,6 +658,12 @@ class KernelBuilder:
                     load_node_vec(5),
                     load_node_vec(6),
                 ]
+            if forest_height >= 3:
+                # Preload depth 3 nodes (7-14) for 8-way selection
+                node_vecs[3] = [load_node_vec(i) for i in range(7, 15)]
+
+        # Constants for depth 3 bit extraction
+        two_vec = self.vector_const(2)
 
         if vec_batches:
             addr_val = self.alloc_temp(1)
@@ -722,6 +759,38 @@ class KernelBuilder:
                         # Path update
                         for regs in regs_list:
                             emit_vec_path_update(regs, reset_path)
+
+                    elif depth == 3 and 3 in node_vecs:
+                        # Depth 3: 8-way selection using shared temps
+                        # This saves 512 loads by preloading nodes 7-14
+                        # Uses 7 vselects per block instead of 8 gather loads
+                        nodes8 = node_vecs[3]
+
+                        # Allocate shared temps for 8-way selection (once for all blocks)
+                        bit_temps = [self.alloc_temp(VLEN) for _ in range(3)]
+                        sel_temps = [self.alloc_temp(VLEN) for _ in range(4)]
+
+                        # Process blocks sequentially with shared temps
+                        for regs in regs_list:
+                            # 8-way select: choose node based on 3-bit path
+                            self.emit_select_8way(
+                                regs["node"], regs["path"], nodes8,
+                                one_vec, two_vec, bit_temps, sel_temps
+                            )
+                            # XOR with selected node
+                            self._emit("valu", ("^", regs["val"], regs["val"], regs["node"]))
+                            # Hash
+                            self.build_hash_vector(
+                                regs["val"], regs["tmp"], regs["node"],
+                                round_idx, regs["offset"]
+                            )
+                            # Path update
+                            emit_vec_path_update(regs, reset_path)
+
+                        # Free shared temps
+                        for t in bit_temps + sel_temps:
+                            self.free_temp(t, VLEN)
+
                     else:
                         for regs in regs_list:
                             depth_addr = depth_addr_scalars[depth]
