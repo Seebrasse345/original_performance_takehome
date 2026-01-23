@@ -702,7 +702,7 @@ class KernelBuilder:
                     self._emit("alu", ("+", path_lane, path_lane, tmp_lane))
 
         if vec_batches:
-            unroll = min(27, vec_batches)
+            unroll = min(28, vec_batches)
             for round_idx in range(rounds):
                 depth = round_idx % (forest_height + 1)
                 reset_path = depth == forest_height
