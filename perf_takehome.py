@@ -88,6 +88,10 @@ class ScratchAllocator:
 
 
 class Scheduler:
+    """
+    SLIL-based scheduler (Sum of Live Interval Lengths) from Shobaki et al., CGO 2020.
+    Combines height-based critical path scheduling with register pressure awareness.
+    """
     def __init__(self, slot_limits):
         self.slot_limits = slot_limits
         self.last_report = None
@@ -112,14 +116,43 @@ class Scheduler:
         preds, succs = self._build_deps(ops)
         pred_count = [len(p) for p in preds]
         heights = self._compute_heights(succs)
+
+        # SLIL: Track last use of each scratch address for live interval computation
+        last_use = self._compute_last_uses(ops, succs)
+
         ready = {i for i, count in enumerate(pred_count) if count == 0}
         instrs = []
+        cycle = 0
+        scheduled_cycle = {}  # op_idx -> cycle when scheduled
+        live_addrs = set()  # Currently live scratch addresses
+        addr_def_cycle = {}  # addr -> cycle when defined
+
         while ready:
             cycle_ops = defaultdict(list)
             cycle_reads = set()
             cycle_writes = set()
             scheduled = []
-            for idx in sorted(ready, key=lambda i: (-heights[i], i)):
+
+            # SLIL-aware sorting: prioritize by height, then by minimizing live interval extension
+            def slil_priority(idx):
+                op = ops[idx]
+                height_score = -heights[idx]
+
+                # SLIL: prefer ops whose inputs have their last use here (reduces live set)
+                last_use_score = 0
+                for addr in op.reads:
+                    if last_use.get(addr) == idx:
+                        last_use_score -= 1  # Good: this is the last use
+
+                # SLIL: prefer ops that produce values used soon (short live intervals)
+                early_consumer_score = 0
+                for s in succs[idx]:
+                    if heights[s] > 0:
+                        early_consumer_score -= 1
+
+                return (height_score, last_use_score, early_consumer_score, idx)
+
+            for idx in sorted(ready, key=slil_priority):
                 op = ops[idx]
                 if len(cycle_ops[op.engine]) >= self.slot_limits[op.engine]:
                     continue
@@ -133,6 +166,7 @@ class Scheduler:
                 cycle_reads |= op.reads
                 cycle_writes |= op.writes
                 scheduled.append(idx)
+
             if not scheduled:
                 idx = max(ready, key=lambda i: (heights[i], -i))
                 op = ops[idx]
@@ -140,20 +174,33 @@ class Scheduler:
                 cycle_reads |= op.reads
                 cycle_writes |= op.writes
                 scheduled.append(idx)
+
             ready -= set(scheduled)
             ready_next = set()
             for idx in scheduled:
+                scheduled_cycle[idx] = cycle
                 for succ in succs[idx]:
                     pred_count[succ] -= 1
                     if pred_count[succ] == 0:
                         ready_next.add(succ)
             ready |= ready_next
             instrs.append(dict(cycle_ops))
+            cycle += 1
             if report_rows is not None:
                 report_rows.append(
                     {engine: len(slots) for engine, slots in cycle_ops.items()}
                 )
         return instrs
+
+    def _compute_last_uses(self, ops, succs):
+        """Compute the last op that uses each scratch address (for SLIL)"""
+        last_use = {}
+        for i in range(len(ops) - 1, -1, -1):
+            op = ops[i]
+            for addr in op.reads:
+                if addr not in last_use:
+                    last_use[addr] = i
+        return last_use
 
     def _build_deps(self, ops: list[Op]):
         preds = [set() for _ in ops]
@@ -469,6 +516,28 @@ class KernelBuilder:
             keys = [(round_idx, base_i + lane, "hash_stage", hi) for lane in range(VLEN)]
             self.emit_debug_vcompare(val_vec, keys)
 
+    def build_hash_vector_jlane(self, regs_list, round_idx):
+        """
+        J-lane parallel hashing with latency hiding.
+        Process same hash stage across multiple blocks before moving to next stage.
+        This interleaves dependent operations to hide latency.
+        """
+        for hi, stage in enumerate(self.hash_vec_stages):
+            if stage["linear"]:
+                # Emit multiply_add for all blocks at this stage
+                for regs in regs_list:
+                    self._emit("valu", ("multiply_add", regs["val"], regs["val"], stage["k"], stage["val1"]))
+            else:
+                # Emit op1 for all blocks
+                for regs in regs_list:
+                    self._emit("valu", (stage["op1"], regs["tmp"], regs["val"], stage["val1"]))
+                # Emit op3 for all blocks
+                for regs in regs_list:
+                    self._emit("valu", (stage["op3"], regs["node"], regs["val"], stage["val3"]))
+                # Emit op2 for all blocks
+                for regs in regs_list:
+                    self._emit("valu", (stage["op2"], regs["val"], regs["tmp"], regs["node"]))
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -596,7 +665,7 @@ class KernelBuilder:
                     self._emit("alu", ("+", path_lane, path_lane, tmp_lane))
 
         if vec_batches:
-            unroll = min(28, vec_batches)
+            unroll = min(27, vec_batches)
             for round_idx in range(rounds):
                 depth = round_idx % (forest_height + 1)
                 reset_path = depth == forest_height
@@ -609,91 +678,49 @@ class KernelBuilder:
 
                     if depth == 0 and 0 in node_vecs:
                         node0_vec = node_vecs[0][0]
+                        # Interleave: XOR all blocks, then hash all blocks, then path update
                         for regs in regs_list:
-                            self._emit(
-                                "valu", ("^", regs["val"], regs["val"], node0_vec)
-                            )
-                            self.build_hash_vector(
-                                regs["val"],
-                                regs["tmp"],
-                                regs["node"],
-                                round_idx,
-                                regs["offset"],
-                            )
+                            self._emit("valu", ("^", regs["val"], regs["val"], node0_vec))
+                        # J-lane parallel hash across all blocks
+                        self.build_hash_vector_jlane(regs_list, round_idx)
+                        # Path update for all blocks
+                        for regs in regs_list:
                             emit_vec_path_update(regs, reset_path, depth0=True)
+
                     elif depth == 1 and 1 in node_vecs:
                         node1_vec, node2_vec = node_vecs[1]
+                        # Interleave: select all, XOR all, hash all, path update all
                         for regs in regs_list:
-                            self._emit(
-                                "flow",
-                                (
-                                    "vselect",
-                                    regs["node"],
-                                    regs["path"],
-                                    node2_vec,
-                                    node1_vec,
-                                ),
-                            )
-                            self._emit(
-                                "valu", ("^", regs["val"], regs["val"], regs["node"])
-                            )
-                            self.build_hash_vector(
-                                regs["val"],
-                                regs["tmp"],
-                                regs["node"],
-                                round_idx,
-                                regs["offset"],
-                            )
+                            self._emit("flow", ("vselect", regs["node"], regs["path"], node2_vec, node1_vec))
+                        for regs in regs_list:
+                            self._emit("valu", ("^", regs["val"], regs["val"], regs["node"]))
+                        self.build_hash_vector_jlane(regs_list, round_idx)
+                        for regs in regs_list:
                             emit_vec_path_update(regs, reset_path)
+
                     elif depth == 2 and 2 in node_vecs:
                         node3_vec, node4_vec, node5_vec, node6_vec = node_vecs[2]
+                        # Interleave: bit extract, selects, XOR, hash, path update
                         for regs in regs_list:
-                            self._emit(
-                                "valu", ("&", regs["addr"], regs["path"], one_vec)
-                            )
-                            self._emit(
-                                "valu", (">>", regs["tmp"], regs["path"], one_vec)
-                            )
-                            self._emit(
-                                "flow",
-                                (
-                                    "vselect",
-                                    regs["node"],
-                                    regs["addr"],
-                                    node4_vec,
-                                    node3_vec,
-                                ),
-                            )
-                            self._emit(
-                                "flow",
-                                (
-                                    "vselect",
-                                    regs["addr"],
-                                    regs["addr"],
-                                    node6_vec,
-                                    node5_vec,
-                                ),
-                            )
-                            self._emit(
-                                "flow",
-                                (
-                                    "vselect",
-                                    regs["node"],
-                                    regs["tmp"],
-                                    regs["addr"],
-                                    regs["node"],
-                                ),
-                            )
-                            self._emit(
-                                "valu", ("^", regs["val"], regs["val"], regs["node"])
-                            )
-                            self.build_hash_vector(
-                                regs["val"],
-                                regs["tmp"],
-                                regs["node"],
-                                round_idx,
-                                regs["offset"],
-                            )
+                            self._emit("valu", ("&", regs["addr"], regs["path"], one_vec))
+                        for regs in regs_list:
+                            self._emit("valu", (">>", regs["tmp"], regs["path"], one_vec))
+                        # Select stage 1
+                        for regs in regs_list:
+                            self._emit("flow", ("vselect", regs["node"], regs["addr"], node4_vec, node3_vec))
+                        # Select stage 2
+                        for regs in regs_list:
+                            self._emit("flow", ("vselect", regs["addr"], regs["addr"], node6_vec, node5_vec))
+                        # Select stage 3
+                        for regs in regs_list:
+                            self._emit("flow", ("vselect", regs["node"], regs["tmp"], regs["addr"], regs["node"]))
+                        # XOR
+                        for regs in regs_list:
+                            self._emit("valu", ("^", regs["val"], regs["val"], regs["node"]))
+                        # J-lane hash
+                        self.build_hash_vector_jlane(regs_list, round_idx)
+                        # Path update
+                        for regs in regs_list:
                             emit_vec_path_update(regs, reset_path)
                     else:
                         for regs in regs_list:
@@ -714,17 +741,15 @@ class KernelBuilder:
                                     "load",
                                     ("load_offset", regs["node"], regs["addr"], offset),
                                 )
+                        # XOR for all blocks
                         for regs in regs_list:
                             self._emit(
                                 "valu", ("^", regs["val"], regs["val"], regs["node"])
                             )
-                            self.build_hash_vector(
-                                regs["val"],
-                                regs["tmp"],
-                                regs["node"],
-                                round_idx,
-                                regs["offset"],
-                            )
+                        # J-lane hash across all blocks
+                        self.build_hash_vector_jlane(regs_list, round_idx)
+                        # Path update for all blocks
+                        for regs in regs_list:
                             emit_vec_path_update(regs, reset_path)
 
                     for regs in regs_list:
