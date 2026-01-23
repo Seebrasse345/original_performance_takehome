@@ -133,7 +133,7 @@ class Scheduler:
             cycle_writes = set()
             scheduled = []
 
-            # Load-aware SLIL scheduling with address prefetch prioritization
+            # Load-aware SLIL scheduling
             def slil_priority(idx):
                 op = ops[idx]
                 height_score = -heights[idx]
@@ -538,37 +538,6 @@ class KernelBuilder:
                 for regs in regs_list:
                     self._emit("valu", (stage["op2"], regs["val"], regs["tmp"], regs["node"]))
 
-    def emit_select_8way(self, dest, path, nodes8, one_vec, two_vec, bit_temps, sel_temps):
-        """
-        Select one of 8 node values based on 3-bit path using 7 vselects.
-        Uses shared temps across blocks for efficiency.
-        nodes8: list of 8 broadcast vectors [n0, n1, n2, n3, n4, n5, n6, n7]
-        bit_temps: [bit0, bit1, bit2] - temps for extracted bits
-        sel_temps: [sel_a, sel_b, sel_c, sel_d] - temps for selection tree
-        """
-        bit0, bit1, bit2 = bit_temps
-        sel_a, sel_b, sel_c, sel_d = sel_temps
-
-        # Extract 3 bits from path
-        self._emit("valu", ("&", bit0, path, one_vec))            # bit0 = path & 1
-        self._emit("valu", (">>", bit1, path, one_vec))
-        self._emit("valu", ("&", bit1, bit1, one_vec))            # bit1 = (path >> 1) & 1
-        self._emit("valu", (">>", bit2, path, two_vec))
-        self._emit("valu", ("&", bit2, bit2, one_vec))            # bit2 = (path >> 2) & 1
-
-        # Level 1: Select pairs based on bit0 (4 vselects)
-        self._emit("flow", ("vselect", sel_a, bit0, nodes8[1], nodes8[0]))
-        self._emit("flow", ("vselect", sel_b, bit0, nodes8[3], nodes8[2]))
-        self._emit("flow", ("vselect", sel_c, bit0, nodes8[5], nodes8[4]))
-        self._emit("flow", ("vselect", sel_d, bit0, nodes8[7], nodes8[6]))
-
-        # Level 2: Select based on bit1 (2 vselects)
-        self._emit("flow", ("vselect", sel_a, bit1, sel_b, sel_a))
-        self._emit("flow", ("vselect", sel_c, bit1, sel_d, sel_c))
-
-        # Level 3: Select based on bit2 (1 vselect)
-        self._emit("flow", ("vselect", dest, bit2, sel_c, sel_a))
-
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -769,25 +738,43 @@ class KernelBuilder:
                         bit_temps = [self.alloc_temp(VLEN) for _ in range(3)]
                         sel_temps = [self.alloc_temp(VLEN) for _ in range(4)]
 
-                        # Phase 1: 8-way select for all blocks (sequential due to shared temps)
+                        # 8-way select for each block sequentially (shared temps)
                         for regs in regs_list:
-                            self.emit_select_8way(
-                                regs["node"], regs["path"], nodes8,
-                                one_vec, two_vec, bit_temps, sel_temps
-                            )
+                            bit0, bit1, bit2 = bit_temps
+                            sel_a, sel_b, sel_c, sel_d = sel_temps
 
-                        # Free shared temps early to reduce pressure
+                            # Extract 3 bits from path
+                            self._emit("valu", ("&", bit0, regs["path"], one_vec))
+                            self._emit("valu", (">>", bit1, regs["path"], one_vec))
+                            self._emit("valu", ("&", bit1, bit1, one_vec))
+                            self._emit("valu", (">>", bit2, regs["path"], two_vec))
+                            self._emit("valu", ("&", bit2, bit2, one_vec))
+
+                            # Level 1 selects
+                            self._emit("flow", ("vselect", sel_a, bit0, nodes8[1], nodes8[0]))
+                            self._emit("flow", ("vselect", sel_b, bit0, nodes8[3], nodes8[2]))
+                            self._emit("flow", ("vselect", sel_c, bit0, nodes8[5], nodes8[4]))
+                            self._emit("flow", ("vselect", sel_d, bit0, nodes8[7], nodes8[6]))
+
+                            # Level 2 selects
+                            self._emit("flow", ("vselect", sel_a, bit1, sel_b, sel_a))
+                            self._emit("flow", ("vselect", sel_c, bit1, sel_d, sel_c))
+
+                            # Level 3 select
+                            self._emit("flow", ("vselect", regs["node"], bit2, sel_c, sel_a))
+
+                        # Free shared temps
                         for t in bit_temps + sel_temps:
                             self.free_temp(t, VLEN)
 
-                        # Phase 2: XOR for all blocks (interleaved)
+                        # XOR for all blocks
                         for regs in regs_list:
                             self._emit("valu", ("^", regs["val"], regs["val"], regs["node"]))
 
-                        # Phase 3: J-lane hash across all blocks
+                        # J-lane hash across all blocks
                         self.build_hash_vector_jlane(regs_list, round_idx)
 
-                        # Phase 4: Path update for all blocks
+                        # Path update for all blocks
                         for regs in regs_list:
                             emit_vec_path_update(regs, reset_path)
 
