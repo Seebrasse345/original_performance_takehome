@@ -685,7 +685,7 @@ class KernelBuilder:
                     self._emit("alu", ("+", path_lane, path_lane, tmp_lane))
 
         if vec_batches:
-            unroll = min(29, vec_batches)
+            unroll = min(30, vec_batches)
             for round_idx in range(rounds):
                 depth = round_idx % (forest_height + 1)
                 reset_path = depth == forest_height
@@ -742,17 +742,20 @@ class KernelBuilder:
                             emit_vec_path_update(regs, reset_path)
 
                     elif depth == 3 and 3 in node_vecs:
-                        # Depth 3: 8-way selection using shared temps
+                        # Depth 3: 8-way selection reusing block temps (saves 48 words)
+                        # Research: "Live Range Optimization" - reuse temps not needed at this depth
+                        # At depth 3, regs["addr"] and regs["tmp"] are unused (no address computation)
                         nodes8 = node_vecs[3]
 
-                        # Allocate shared temps for 8-way selection (3 sel temps by interleaving)
+                        # Only allocate 3 shared temps for bits (reuse block temps for selection)
                         bit_temps = [self.alloc_temp(VLEN) for _ in range(3)]
-                        sel_temps = [self.alloc_temp(VLEN) for _ in range(3)]
 
-                        # 8-way select for each block (interleaved to reduce temps)
+                        # 8-way select for each block
                         for regs in regs_list:
                             bit0, bit1, bit2 = bit_temps
-                            sel_a, sel_b, sel_c = sel_temps
+                            # Reuse block temps as selection temps (not used at depth 3)
+                            sel_a = regs["addr"]  # Reuse addr
+                            sel_b = regs["tmp"]   # Reuse tmp
 
                             # Extract 3 bits from path (4 ops)
                             self._emit("valu", ("&", bit0, regs["path"], one_vec))
@@ -760,20 +763,25 @@ class KernelBuilder:
                             self._emit("valu", (">>", bit2, bit1, one_vec))  # bit2 = tmp >> 1
                             self._emit("valu", ("&", bit1, bit1, one_vec))  # bit1 = tmp & 1
 
-                            # Interleaved selection: process nodes 0-3, then 4-7
+                            # Interleaved selection using only 2 sel temps
+                            # Nodes 0-3
                             self._emit("flow", ("vselect", sel_a, bit0, nodes8[1], nodes8[0]))
                             self._emit("flow", ("vselect", sel_b, bit0, nodes8[3], nodes8[2]))
                             self._emit("flow", ("vselect", sel_a, bit1, sel_b, sel_a))  # nodes 0-3 result
 
+                            # Nodes 4-7: reuse bit2 as sel_c since bit extraction is done
                             self._emit("flow", ("vselect", sel_b, bit0, nodes8[5], nodes8[4]))
-                            self._emit("flow", ("vselect", sel_c, bit0, nodes8[7], nodes8[6]))
-                            self._emit("flow", ("vselect", sel_b, bit1, sel_c, sel_b))  # nodes 4-7 result
+                            self._emit("flow", ("vselect", bit2, bit0, nodes8[7], nodes8[6]))  # use bit2 as sel_c
+                            self._emit("flow", ("vselect", sel_b, bit1, bit2, sel_b))  # nodes 4-7 result
 
-                            # Level 3: final selection
+                            # Level 3: final selection (need bit2 value from earlier)
+                            # Recompute bit2 for final select
+                            self._emit("valu", (">>", bit2, regs["path"], one_vec))
+                            self._emit("valu", (">>", bit2, bit2, one_vec))  # bit2 = path >> 2
                             self._emit("flow", ("vselect", regs["node"], bit2, sel_b, sel_a))
 
                         # Free shared temps
-                        for t in bit_temps + sel_temps:
+                        for t in bit_temps:
                             self.free_temp(t, VLEN)
 
                         # XOR for all blocks
