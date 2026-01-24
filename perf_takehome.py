@@ -742,20 +742,19 @@ class KernelBuilder:
                             emit_vec_path_update(regs, reset_path)
 
                     elif depth == 3 and 3 in node_vecs:
-                        # Depth 3: 8-way selection reusing block temps (saves 48 words)
+                        # Depth 3: 8-way selection reusing block temps (saves 24 words)
                         # Research: "Live Range Optimization" - reuse temps not needed at this depth
-                        # At depth 3, regs["addr"] and regs["tmp"] are unused (no address computation)
                         nodes8 = node_vecs[3]
 
-                        # Only allocate 3 shared temps for bits (reuse block temps for selection)
+                        # Allocate 3 shared temps for bits (reuse block temps for selection)
                         bit_temps = [self.alloc_temp(VLEN) for _ in range(3)]
 
                         # 8-way select for each block
                         for regs in regs_list:
                             bit0, bit1, bit2 = bit_temps
                             # Reuse block temps as selection temps (not used at depth 3)
-                            sel_a = regs["addr"]  # Reuse addr
-                            sel_b = regs["tmp"]   # Reuse tmp
+                            sel_a = regs["addr"]
+                            sel_b = regs["tmp"]
 
                             # Extract 3 bits from path (4 ops)
                             self._emit("valu", ("&", bit0, regs["path"], one_vec))
@@ -763,19 +762,18 @@ class KernelBuilder:
                             self._emit("valu", (">>", bit2, bit1, one_vec))  # bit2 = tmp >> 1
                             self._emit("valu", ("&", bit1, bit1, one_vec))  # bit1 = tmp & 1
 
-                            # Interleaved selection using only 2 sel temps
+                            # Selection cascade using 2 sel temps + reusing bit2 as sel_c
                             # Nodes 0-3
                             self._emit("flow", ("vselect", sel_a, bit0, nodes8[1], nodes8[0]))
                             self._emit("flow", ("vselect", sel_b, bit0, nodes8[3], nodes8[2]))
-                            self._emit("flow", ("vselect", sel_a, bit1, sel_b, sel_a))  # nodes 0-3 result
+                            self._emit("flow", ("vselect", sel_a, bit1, sel_b, sel_a))  # nodes 0-3 in sel_a
 
-                            # Nodes 4-7: reuse bit2 as sel_c since bit extraction is done
+                            # Nodes 4-7: reuse bit2 as sel_c since we saved the value we need
                             self._emit("flow", ("vselect", sel_b, bit0, nodes8[5], nodes8[4]))
-                            self._emit("flow", ("vselect", bit2, bit0, nodes8[7], nodes8[6]))  # use bit2 as sel_c
-                            self._emit("flow", ("vselect", sel_b, bit1, bit2, sel_b))  # nodes 4-7 result
+                            self._emit("flow", ("vselect", bit2, bit0, nodes8[7], nodes8[6]))  # bit2 as sel_c
+                            self._emit("flow", ("vselect", sel_b, bit1, bit2, sel_b))  # nodes 4-7 in sel_b
 
-                            # Level 3: final selection (need bit2 value from earlier)
-                            # Recompute bit2 for final select
+                            # Recompute bit2 for final select (needed because we overwrote it)
                             self._emit("valu", (">>", bit2, regs["path"], one_vec))
                             self._emit("valu", (">>", bit2, bit2, one_vec))  # bit2 = path >> 2
                             self._emit("flow", ("vselect", regs["node"], bit2, sel_b, sel_a))
