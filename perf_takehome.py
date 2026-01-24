@@ -759,12 +759,12 @@ class KernelBuilder:
                             bit0, bit1, bit2 = bit_temps
                             sel_a, sel_b, sel_c, sel_d = sel_temps
 
-                            # Extract 3 bits from path
+                            # Extract 3 bits from path (optimized: 4 ops instead of 5)
+                            # bit0 = path & 1, tmp = path >> 1, bit1 = tmp & 1, bit2 = tmp >> 1
                             self._emit("valu", ("&", bit0, regs["path"], one_vec))
-                            self._emit("valu", (">>", bit1, regs["path"], one_vec))
-                            self._emit("valu", ("&", bit1, bit1, one_vec))
-                            self._emit("valu", (">>", bit2, regs["path"], two_vec))
-                            self._emit("valu", ("&", bit2, bit2, one_vec))
+                            self._emit("valu", (">>", bit1, regs["path"], one_vec))  # tmp in bit1
+                            self._emit("valu", (">>", bit2, bit1, one_vec))  # bit2 = tmp >> 1
+                            self._emit("valu", ("&", bit1, bit1, one_vec))  # bit1 = tmp & 1
 
                             # Level 1 selects
                             self._emit("flow", ("vselect", sel_a, bit0, nodes8[1], nodes8[0]))
