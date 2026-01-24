@@ -643,14 +643,22 @@ class KernelBuilder:
                 node_vecs[3] = [load_node_vec(i) for i in range(7, 15)]
 
         if vec_batches:
-            addr_val = self.alloc_temp(1)
-            self._emit(
-                "flow", ("add_imm", addr_val, self.scratch["inp_values_p"], 0)
-            )
-            for block in vec_blocks:
-                self._emit("load", ("vload", block["val"], addr_val))
-                self._emit("flow", ("add_imm", addr_val, addr_val, VLEN))
-            self.free_temp(addr_val, 1)
+            # Use paired addresses to better utilize 2 load slots per cycle
+            addr0 = self.alloc_temp(1)
+            addr1 = self.alloc_temp(1)
+            self._emit("flow", ("add_imm", addr0, self.scratch["inp_values_p"], 0))
+            self._emit("flow", ("add_imm", addr1, self.scratch["inp_values_p"], VLEN))
+            n_pairs = len(vec_blocks) // 2
+            for pair_idx in range(n_pairs):
+                i = pair_idx * 2
+                self._emit("load", ("vload", vec_blocks[i]["val"], addr0))
+                self._emit("load", ("vload", vec_blocks[i+1]["val"], addr1))
+                # Skip address update on last pair
+                if pair_idx < n_pairs - 1:
+                    self._emit("flow", ("add_imm", addr0, addr0, 2 * VLEN))
+                    self._emit("flow", ("add_imm", addr1, addr1, 2 * VLEN))
+            self.free_temp(addr0, 1)
+            self.free_temp(addr1, 1)
 
         def alloc_vec_temps():
             return {
@@ -692,7 +700,7 @@ class KernelBuilder:
 
                     if depth == 0 and 0 in node_vecs:
                         node0_vec = node_vecs[0][0]
-                        # Per-lane ALU XOR instead of VALU (ALU has 12 slots vs VALU 6)
+                        # Per-lane ALU XOR allows parallel execution with VALU hash ops
                         for regs in regs_list:
                             for lane in range(VLEN):
                                 self._emit("alu", ("^", regs["val"] + lane, regs["val"] + lane, node0_vec + lane))
@@ -708,7 +716,7 @@ class KernelBuilder:
                         # Interleave: select all, XOR all, hash all, path update all
                         for regs in regs_list:
                             self._emit("flow", ("vselect", regs["node"], regs["path"], node2_vec, node1_vec))
-                        # Per-lane ALU XOR
+                        # Per-lane ALU XOR allows parallel execution with VALU hash ops
                         for regs in regs_list:
                             for lane in range(VLEN):
                                 self._emit("alu", ("^", regs["val"] + lane, regs["val"] + lane, regs["node"] + lane))
@@ -732,7 +740,7 @@ class KernelBuilder:
                             self._emit("flow", ("vselect", regs["addr"], regs["addr"], node6_vec, node5_vec))
                         for regs in regs_list:
                             self._emit("flow", ("vselect", regs["node"], regs["tmp"], regs["addr"], regs["node"]))
-                        # Per-lane ALU XOR
+                        # Per-lane ALU XOR allows parallel execution with VALU hash ops
                         for regs in regs_list:
                             for lane in range(VLEN):
                                 self._emit("alu", ("^", regs["val"] + lane, regs["val"] + lane, regs["node"] + lane))
@@ -824,14 +832,22 @@ class KernelBuilder:
                     for regs in regs_list:
                         free_vec_temps(regs)
 
-            addr_val = self.alloc_temp(1)
-            self._emit(
-                "flow", ("add_imm", addr_val, self.scratch["inp_values_p"], 0)
-            )
-            for block in vec_blocks:
-                self._emit("store", ("vstore", addr_val, block["val"]))
-                self._emit("flow", ("add_imm", addr_val, addr_val, VLEN))
-            self.free_temp(addr_val, 1)
+            # Use paired addresses to better utilize 2 store slots per cycle
+            addr0 = self.alloc_temp(1)
+            addr1 = self.alloc_temp(1)
+            self._emit("flow", ("add_imm", addr0, self.scratch["inp_values_p"], 0))
+            self._emit("flow", ("add_imm", addr1, self.scratch["inp_values_p"], VLEN))
+            n_pairs = len(vec_blocks) // 2
+            for pair_idx in range(n_pairs):
+                i = pair_idx * 2
+                self._emit("store", ("vstore", addr0, vec_blocks[i]["val"]))
+                self._emit("store", ("vstore", addr1, vec_blocks[i+1]["val"]))
+                # Skip address update on last pair
+                if pair_idx < n_pairs - 1:
+                    self._emit("flow", ("add_imm", addr0, addr0, 2 * VLEN))
+                    self._emit("flow", ("add_imm", addr1, addr1, 2 * VLEN))
+            self.free_temp(addr0, 1)
+            self.free_temp(addr1, 1)
 
         tail = batch_size - tail_start
         if tail:
