@@ -647,9 +647,6 @@ class KernelBuilder:
                 # Preload depth 3 nodes (7-14) for 8-way selection
                 node_vecs[3] = [load_node_vec(i) for i in range(7, 15)]
 
-        # Constants for depth 3 bit extraction
-        two_vec = self.vector_const(2)
-
         if vec_batches:
             addr_val = self.alloc_temp(1)
             self._emit(
@@ -687,7 +684,7 @@ class KernelBuilder:
                     self._emit("alu", ("+", path_lane, path_lane, tmp_lane))
 
         if vec_batches:
-            unroll = min(28, vec_batches)
+            unroll = min(29, vec_batches)
             for round_idx in range(rounds):
                 depth = round_idx % (forest_height + 1)
                 reset_path = depth == forest_height
