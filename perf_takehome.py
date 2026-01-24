@@ -158,10 +158,6 @@ class Scheduler:
                     return False
                 if op.writes & cycle_writes:
                     return False
-                if op.reads & cycle_writes:
-                    return False
-                if op.writes & cycle_reads:
-                    return False
                 cycle_ops[op.engine].append(op.slot)
                 cycle_reads.update(op.reads)
                 cycle_writes.update(op.writes)
@@ -169,7 +165,7 @@ class Scheduler:
                 return True
 
             ready_sorted = sorted(ready, key=slil_priority)
-            engine_passes = ("flow", "valu", "load", "alu", "store", "debug")
+            engine_passes = ("valu", "load", "alu", "flow", "store", "debug")
             for engine in engine_passes:
                 for idx in ready_sorted:
                     if idx in scheduled:
@@ -591,11 +587,10 @@ class KernelBuilder:
         # Only allocate for depths 4+ (depth 3 uses preloaded nodes)
         for depth in range(4, forest_height + 1):
             base = (1 << depth) - 1
-            base_const = self.scratch_const(base)
             addr_scalar = self.alloc_scratch(length=1)
             self._emit(
-                "alu",
-                ("+", addr_scalar, self.scratch["forest_values_p"], base_const),
+                "flow",
+                ("add_imm", addr_scalar, self.scratch["forest_values_p"], base),
             )
             depth_addr_scalars[depth] = addr_scalar
 
@@ -623,10 +618,9 @@ class KernelBuilder:
             node_val = self.alloc_scratch(length=1)
 
             def load_node_vec(node_idx):
-                idx_const = self.scratch_const(node_idx)
                 self._emit(
-                    "alu",
-                    ("+", node_addr, self.scratch["forest_values_p"], idx_const),
+                    "flow",
+                    ("add_imm", node_addr, self.scratch["forest_values_p"], node_idx),
                 )
                 self._emit("load", ("load", node_val, node_addr))
                 node_vec = self.alloc_scratch(length=VLEN)
@@ -698,25 +692,31 @@ class KernelBuilder:
 
                     if depth == 0 and 0 in node_vecs:
                         node0_vec = node_vecs[0][0]
-                        # Interleave: XOR all blocks, then hash all blocks, then path update
+                        # Per-lane ALU XOR instead of VALU (ALU has 12 slots vs VALU 6)
                         for regs in regs_list:
-                            self._emit("valu", ("^", regs["val"], regs["val"], node0_vec))
+                            for lane in range(VLEN):
+                                self._emit("alu", ("^", regs["val"] + lane, regs["val"] + lane, node0_vec + lane))
                         # J-lane parallel hash across all blocks
                         self.build_hash_vector_jlane(regs_list, round_idx)
-                        # Path update for all blocks
-                        for regs in regs_list:
-                            emit_vec_path_update(regs, reset_path, depth0=True)
+                        # Skip path update on last round
+                        if round_idx != rounds - 1 and not reset_path:
+                            for regs in regs_list:
+                                emit_vec_path_update(regs, reset_path, depth0=True)
 
                     elif depth == 1 and 1 in node_vecs:
                         node1_vec, node2_vec = node_vecs[1]
                         # Interleave: select all, XOR all, hash all, path update all
                         for regs in regs_list:
                             self._emit("flow", ("vselect", regs["node"], regs["path"], node2_vec, node1_vec))
+                        # Per-lane ALU XOR
                         for regs in regs_list:
-                            self._emit("valu", ("^", regs["val"], regs["val"], regs["node"]))
+                            for lane in range(VLEN):
+                                self._emit("alu", ("^", regs["val"] + lane, regs["val"] + lane, regs["node"] + lane))
                         self.build_hash_vector_jlane(regs_list, round_idx)
-                        for regs in regs_list:
-                            emit_vec_path_update(regs, reset_path)
+                        # Skip path update on last round
+                        if round_idx != rounds - 1 and not reset_path:
+                            for regs in regs_list:
+                                emit_vec_path_update(regs, reset_path)
 
                     elif depth == 2 and 2 in node_vecs:
                         node3_vec, node4_vec, node5_vec, node6_vec = node_vecs[2]
@@ -732,29 +732,29 @@ class KernelBuilder:
                             self._emit("flow", ("vselect", regs["addr"], regs["addr"], node6_vec, node5_vec))
                         for regs in regs_list:
                             self._emit("flow", ("vselect", regs["node"], regs["tmp"], regs["addr"], regs["node"]))
-                        # XOR
+                        # Per-lane ALU XOR
                         for regs in regs_list:
-                            self._emit("valu", ("^", regs["val"], regs["val"], regs["node"]))
+                            for lane in range(VLEN):
+                                self._emit("alu", ("^", regs["val"] + lane, regs["val"] + lane, regs["node"] + lane))
                         # J-lane hash
                         self.build_hash_vector_jlane(regs_list, round_idx)
-                        # Path update
-                        for regs in regs_list:
-                            emit_vec_path_update(regs, reset_path)
+                        # Skip path update on last round
+                        if round_idx != rounds - 1 and not reset_path:
+                            for regs in regs_list:
+                                emit_vec_path_update(regs, reset_path)
 
                     elif depth == 3 and 3 in node_vecs:
-                        # Depth 3: 8-way selection reusing block temps (saves 24 words)
-                        # Research: "Live Range Optimization" - reuse temps not needed at this depth
+                        # Depth 3: 8-way selection using shared temps
                         nodes8 = node_vecs[3]
 
-                        # Allocate 3 shared temps for bits (reuse block temps for selection)
+                        # Allocate shared temps for 8-way selection
                         bit_temps = [self.alloc_temp(VLEN) for _ in range(3)]
+                        sel_temps = [self.alloc_temp(VLEN) for _ in range(3)]
 
                         # 8-way select for each block
                         for regs in regs_list:
                             bit0, bit1, bit2 = bit_temps
-                            # Reuse block temps as selection temps (not used at depth 3)
-                            sel_a = regs["addr"]
-                            sel_b = regs["tmp"]
+                            sel_a, sel_b, sel_c = sel_temps
 
                             # Extract 3 bits from path (4 ops)
                             self._emit("valu", ("&", bit0, regs["path"], one_vec))
@@ -762,24 +762,20 @@ class KernelBuilder:
                             self._emit("valu", (">>", bit2, bit1, one_vec))  # bit2 = tmp >> 1
                             self._emit("valu", ("&", bit1, bit1, one_vec))  # bit1 = tmp & 1
 
-                            # Selection cascade using 2 sel temps + reusing bit2 as sel_c
-                            # Nodes 0-3
+                            # Interleaved selection: process nodes 0-3, then 4-7
                             self._emit("flow", ("vselect", sel_a, bit0, nodes8[1], nodes8[0]))
                             self._emit("flow", ("vselect", sel_b, bit0, nodes8[3], nodes8[2]))
-                            self._emit("flow", ("vselect", sel_a, bit1, sel_b, sel_a))  # nodes 0-3 in sel_a
+                            self._emit("flow", ("vselect", sel_a, bit1, sel_b, sel_a))  # nodes 0-3 result
 
-                            # Nodes 4-7: reuse bit2 as sel_c since we saved the value we need
                             self._emit("flow", ("vselect", sel_b, bit0, nodes8[5], nodes8[4]))
-                            self._emit("flow", ("vselect", bit2, bit0, nodes8[7], nodes8[6]))  # bit2 as sel_c
-                            self._emit("flow", ("vselect", sel_b, bit1, bit2, sel_b))  # nodes 4-7 in sel_b
+                            self._emit("flow", ("vselect", sel_c, bit0, nodes8[7], nodes8[6]))
+                            self._emit("flow", ("vselect", sel_b, bit1, sel_c, sel_b))  # nodes 4-7 result
 
-                            # Recompute bit2 for final select (needed because we overwrote it)
-                            self._emit("valu", (">>", bit2, regs["path"], one_vec))
-                            self._emit("valu", (">>", bit2, bit2, one_vec))  # bit2 = path >> 2
+                            # Level 3: final selection
                             self._emit("flow", ("vselect", regs["node"], bit2, sel_b, sel_a))
 
                         # Free shared temps
-                        for t in bit_temps:
+                        for t in bit_temps + sel_temps:
                             self.free_temp(t, VLEN)
 
                         # XOR for all blocks
@@ -789,9 +785,10 @@ class KernelBuilder:
                         # J-lane hash across all blocks
                         self.build_hash_vector_jlane(regs_list, round_idx)
 
-                        # Path update for all blocks
-                        for regs in regs_list:
-                            emit_vec_path_update(regs, reset_path)
+                        # Skip path update on last round
+                        if round_idx != rounds - 1 and not reset_path:
+                            for regs in regs_list:
+                                emit_vec_path_update(regs, reset_path)
 
                     else:
                         for regs in regs_list:
@@ -819,9 +816,10 @@ class KernelBuilder:
                             )
                         # J-lane hash across all blocks
                         self.build_hash_vector_jlane(regs_list, round_idx)
-                        # Path update for all blocks
-                        for regs in regs_list:
-                            emit_vec_path_update(regs, reset_path)
+                        # Skip path update on last round
+                        if round_idx != rounds - 1 and not reset_path:
+                            for regs in regs_list:
+                                emit_vec_path_update(regs, reset_path)
 
                     for regs in regs_list:
                         free_vec_temps(regs)
