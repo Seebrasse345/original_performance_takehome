@@ -532,7 +532,7 @@ class KernelBuilder:
         """
         J-lane parallel hashing with ILP exploitation.
         Process same hash stage across multiple blocks before moving to next stage.
-        For non-linear stages, op1 and op3 are independent - emit separately.
+        For non-linear stages, op1 and op3 are independent - emit separately for scheduling.
         """
         for hi, stage in enumerate(self.hash_vec_stages):
             if stage["linear"]:
@@ -579,6 +579,9 @@ class KernelBuilder:
             self._emit("load", ("load", self.scratch[v], i_const))
 
         one_const = self.scratch_const(1)
+        zero_const = self.scratch_const(0)
+        vlen_const = self.scratch_const(VLEN)
+        stride_const = self.scratch_const(2 * VLEN)
         self._prepare_hash_stages()
 
         one_vec = self.vector_const(1)
@@ -646,6 +649,7 @@ class KernelBuilder:
             # Use paired addresses to better utilize 2 load slots per cycle
             addr0 = self.alloc_temp(1)
             addr1 = self.alloc_temp(1)
+            # Use flow add_imm for initial setup (ensures correct ordering)
             self._emit("flow", ("add_imm", addr0, self.scratch["inp_values_p"], 0))
             self._emit("flow", ("add_imm", addr1, self.scratch["inp_values_p"], VLEN))
             n_pairs = len(vec_blocks) // 2
@@ -653,10 +657,10 @@ class KernelBuilder:
                 i = pair_idx * 2
                 self._emit("load", ("vload", vec_blocks[i]["val"], addr0))
                 self._emit("load", ("vload", vec_blocks[i+1]["val"], addr1))
-                # Skip address update on last pair
+                # Skip address update on last pair - use ALU add for parallel updates
                 if pair_idx < n_pairs - 1:
-                    self._emit("flow", ("add_imm", addr0, addr0, 2 * VLEN))
-                    self._emit("flow", ("add_imm", addr1, addr1, 2 * VLEN))
+                    self._emit("alu", ("+", addr0, addr0, stride_const))
+                    self._emit("alu", ("+", addr1, addr1, stride_const))
             self.free_temp(addr0, 1)
             self.free_temp(addr1, 1)
 
@@ -835,6 +839,7 @@ class KernelBuilder:
             # Use paired addresses to better utilize 2 store slots per cycle
             addr0 = self.alloc_temp(1)
             addr1 = self.alloc_temp(1)
+            # Use flow add_imm for initial setup (ensures correct ordering)
             self._emit("flow", ("add_imm", addr0, self.scratch["inp_values_p"], 0))
             self._emit("flow", ("add_imm", addr1, self.scratch["inp_values_p"], VLEN))
             n_pairs = len(vec_blocks) // 2
@@ -842,10 +847,10 @@ class KernelBuilder:
                 i = pair_idx * 2
                 self._emit("store", ("vstore", addr0, vec_blocks[i]["val"]))
                 self._emit("store", ("vstore", addr1, vec_blocks[i+1]["val"]))
-                # Skip address update on last pair
+                # Skip address update on last pair - use ALU add for parallel updates
                 if pair_idx < n_pairs - 1:
-                    self._emit("flow", ("add_imm", addr0, addr0, 2 * VLEN))
-                    self._emit("flow", ("add_imm", addr1, addr1, 2 * VLEN))
+                    self._emit("alu", ("+", addr0, addr0, stride_const))
+                    self._emit("alu", ("+", addr1, addr1, stride_const))
             self.free_temp(addr0, 1)
             self.free_temp(addr1, 1)
 
