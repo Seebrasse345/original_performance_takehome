@@ -152,20 +152,36 @@ class Scheduler:
 
                 return (height_score, last_use_score, early_consumer_score, idx)
 
-            for idx in sorted(ready, key=slil_priority):
+            def try_schedule(idx):
                 op = ops[idx]
                 if len(cycle_ops[op.engine]) >= self.slot_limits[op.engine]:
-                    continue
+                    return False
                 if op.writes & cycle_writes:
-                    continue
+                    return False
                 if op.reads & cycle_writes:
-                    continue
+                    return False
                 if op.writes & cycle_reads:
-                    continue
+                    return False
                 cycle_ops[op.engine].append(op.slot)
-                cycle_reads |= op.reads
-                cycle_writes |= op.writes
+                cycle_reads.update(op.reads)
+                cycle_writes.update(op.writes)
                 scheduled.append(idx)
+                return True
+
+            ready_sorted = sorted(ready, key=slil_priority)
+            engine_passes = ("flow", "valu", "load", "alu", "store", "debug")
+            for engine in engine_passes:
+                for idx in ready_sorted:
+                    if idx in scheduled:
+                        continue
+                    if ops[idx].engine != engine:
+                        continue
+                    try_schedule(idx)
+
+            for idx in ready_sorted:
+                if idx in scheduled:
+                    continue
+                try_schedule(idx)
 
             if not scheduled:
                 idx = max(ready, key=lambda i: (heights[i], -i))
