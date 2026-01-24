@@ -534,23 +534,23 @@ class KernelBuilder:
 
     def build_hash_vector_jlane(self, regs_list, round_idx):
         """
-        J-lane parallel hashing with latency hiding.
+        J-lane parallel hashing with ILP exploitation.
         Process same hash stage across multiple blocks before moving to next stage.
-        This interleaves dependent operations to hide latency.
+        For non-linear stages, op1 and op3 are independent - emit separately.
         """
         for hi, stage in enumerate(self.hash_vec_stages):
             if stage["linear"]:
-                # Emit multiply_add for all blocks at this stage
+                # Linear: val = val * k + const1 (single multiply_add)
                 for regs in regs_list:
                     self._emit("valu", ("multiply_add", regs["val"], regs["val"], stage["k"], stage["val1"]))
             else:
-                # Emit op1 for all blocks
+                # Non-linear: op1 and op3 are INDEPENDENT (both read val)
+                # Emit all op1 first, then all op3, to maximize parallel issue
                 for regs in regs_list:
                     self._emit("valu", (stage["op1"], regs["tmp"], regs["val"], stage["val1"]))
-                # Emit op3 for all blocks
                 for regs in regs_list:
                     self._emit("valu", (stage["op3"], regs["node"], regs["val"], stage["val3"]))
-                # Emit op2 for all blocks
+                # op2 depends on both op1 and op3
                 for regs in regs_list:
                     self._emit("valu", (stage["op2"], regs["val"], regs["tmp"], regs["node"]))
 
@@ -588,7 +588,8 @@ class KernelBuilder:
         one_vec = self.vector_const(1)
 
         depth_addr_scalars = {}
-        for depth in range(3, forest_height + 1):
+        # Only allocate for depths 4+ (depth 3 uses preloaded nodes)
+        for depth in range(4, forest_height + 1):
             base = (1 << depth) - 1
             base_const = self.scratch_const(base)
             addr_scalar = self.alloc_scratch(length=1)
