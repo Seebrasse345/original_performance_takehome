@@ -720,18 +720,16 @@ class KernelBuilder:
 
                     elif depth == 2 and 2 in node_vecs:
                         node3_vec, node4_vec, node5_vec, node6_vec = node_vecs[2]
-                        # Interleave: bit extract, selects, XOR, hash, path update
+                        # Bit extraction for all blocks
                         for regs in regs_list:
                             self._emit("valu", ("&", regs["addr"], regs["path"], one_vec))
                         for regs in regs_list:
                             self._emit("valu", (">>", regs["tmp"], regs["path"], one_vec))
-                        # Select stage 1
+                        # 4-way selection cascade for all blocks
                         for regs in regs_list:
                             self._emit("flow", ("vselect", regs["node"], regs["addr"], node4_vec, node3_vec))
-                        # Select stage 2
                         for regs in regs_list:
                             self._emit("flow", ("vselect", regs["addr"], regs["addr"], node6_vec, node5_vec))
-                        # Select stage 3
                         for regs in regs_list:
                             self._emit("flow", ("vselect", regs["node"], regs["tmp"], regs["addr"], regs["node"]))
                         # XOR
@@ -745,7 +743,6 @@ class KernelBuilder:
 
                     elif depth == 3 and 3 in node_vecs:
                         # Depth 3: 8-way selection using shared temps
-                        # Saves 512 loads by preloading nodes 7-14
                         nodes8 = node_vecs[3]
 
                         # Allocate shared temps for 8-way selection (3 sel temps by interleaving)
@@ -764,12 +761,10 @@ class KernelBuilder:
                             self._emit("valu", ("&", bit1, bit1, one_vec))  # bit1 = tmp & 1
 
                             # Interleaved selection: process nodes 0-3, then 4-7
-                            # Nodes 0-3: level 1 pair, then level 2 merge
                             self._emit("flow", ("vselect", sel_a, bit0, nodes8[1], nodes8[0]))
                             self._emit("flow", ("vselect", sel_b, bit0, nodes8[3], nodes8[2]))
                             self._emit("flow", ("vselect", sel_a, bit1, sel_b, sel_a))  # nodes 0-3 result
 
-                            # Nodes 4-7: level 1 pair, then level 2 merge (reuse sel_b, sel_c)
                             self._emit("flow", ("vselect", sel_b, bit0, nodes8[5], nodes8[4]))
                             self._emit("flow", ("vselect", sel_c, bit0, nodes8[7], nodes8[6]))
                             self._emit("flow", ("vselect", sel_b, bit1, sel_c, sel_b))  # nodes 4-7 result
