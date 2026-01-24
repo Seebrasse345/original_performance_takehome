@@ -579,8 +579,6 @@ class KernelBuilder:
             self._emit("load", ("load", self.scratch[v], i_const))
 
         one_const = self.scratch_const(1)
-        zero_const = self.scratch_const(0)
-        vlen_const = self.scratch_const(VLEN)
         stride_const = self.scratch_const(2 * VLEN)
         self._prepare_hash_stages()
 
@@ -599,7 +597,9 @@ class KernelBuilder:
 
         vec_batches = batch_size // VLEN
         tail_start = vec_batches * VLEN
-        tail_const = self.scratch_const(tail_start)
+        tail = batch_size - tail_start
+        # Only allocate tail_const if we have tail elements (saves 1 word when tail=0)
+        tail_const = self.scratch_const(tail_start) if tail else None
 
         if self.enable_debug_ops:
             self._emit("flow", ("pause",), barrier=True)
@@ -649,8 +649,8 @@ class KernelBuilder:
             # Use paired addresses to better utilize 2 load slots per cycle
             addr0 = self.alloc_temp(1)
             addr1 = self.alloc_temp(1)
-            # Use flow add_imm for initial setup (ensures correct ordering)
-            self._emit("flow", ("add_imm", addr0, self.scratch["inp_values_p"], 0))
+            # Use ALU multiply by 1 for addr0 (copy), flow add_imm for addr1
+            self._emit("alu", ("*", addr0, self.scratch["inp_values_p"], one_const))
             self._emit("flow", ("add_imm", addr1, self.scratch["inp_values_p"], VLEN))
             n_pairs = len(vec_blocks) // 2
             for pair_idx in range(n_pairs):
@@ -687,7 +687,8 @@ class KernelBuilder:
                     self._emit("alu", ("&", path_lane, val_lane, one_const))
                 else:
                     self._emit("alu", ("&", tmp_lane, val_lane, one_const))
-                    self._emit("alu", ("<<", path_lane, path_lane, one_const))
+                    # Use add instead of shift: path + path = path << 1
+                    self._emit("alu", ("+", path_lane, path_lane, path_lane))
                     self._emit("alu", ("+", path_lane, path_lane, tmp_lane))
 
         if vec_batches:
@@ -756,17 +757,20 @@ class KernelBuilder:
                                 emit_vec_path_update(regs, reset_path)
 
                     elif depth == 3 and 3 in node_vecs:
-                        # Depth 3: 8-way selection using shared temps
+                        # Depth 3: 8-way selection using per-block temps for bit0/bit1
                         nodes8 = node_vecs[3]
 
-                        # Allocate shared temps for 8-way selection
-                        bit_temps = [self.alloc_temp(VLEN) for _ in range(3)]
+                        # Only need 1 shared temp for bit2 (saves 16 words vs 3 bit_temps)
+                        bit2_temp = self.alloc_temp(VLEN)
                         sel_temps = [self.alloc_temp(VLEN) for _ in range(3)]
 
                         # 8-way select for each block
                         for regs in regs_list:
-                            bit0, bit1, bit2 = bit_temps
                             sel_a, sel_b, sel_c = sel_temps
+                            # Use per-block temps: addr for bit0, tmp for bit1
+                            bit0 = regs["addr"]
+                            bit1 = regs["tmp"]
+                            bit2 = bit2_temp
 
                             # Extract 3 bits from path (4 ops)
                             self._emit("valu", ("&", bit0, regs["path"], one_vec))
@@ -786,8 +790,9 @@ class KernelBuilder:
                             # Level 3: final selection
                             self._emit("flow", ("vselect", regs["node"], bit2, sel_b, sel_a))
 
-                        # Free shared temps
-                        for t in bit_temps + sel_temps:
+                        # Free shared temps (only bit2_temp and sel_temps now)
+                        self.free_temp(bit2_temp, VLEN)
+                        for t in sel_temps:
                             self.free_temp(t, VLEN)
 
                         # XOR for all blocks
@@ -803,8 +808,9 @@ class KernelBuilder:
                                 emit_vec_path_update(regs, reset_path)
 
                     else:
+                        # Compute addresses for all blocks first
+                        depth_addr = depth_addr_scalars[depth]
                         for regs in regs_list:
-                            depth_addr = depth_addr_scalars[depth]
                             for lane in range(VLEN):
                                 self._emit(
                                     "alu",
@@ -815,8 +821,9 @@ class KernelBuilder:
                                         depth_addr,
                                     ),
                                 )
-                        for regs in regs_list:
-                            for offset in range(VLEN):
+                        # Interleave loads by lane across blocks for better scheduling
+                        for offset in range(VLEN):
+                            for regs in regs_list:
                                 self._emit(
                                     "load",
                                     ("load_offset", regs["node"], regs["addr"], offset),
@@ -839,8 +846,8 @@ class KernelBuilder:
             # Use paired addresses to better utilize 2 store slots per cycle
             addr0 = self.alloc_temp(1)
             addr1 = self.alloc_temp(1)
-            # Use flow add_imm for initial setup (ensures correct ordering)
-            self._emit("flow", ("add_imm", addr0, self.scratch["inp_values_p"], 0))
+            # Use ALU multiply by 1 for addr0 (copy), flow add_imm for addr1
+            self._emit("alu", ("*", addr0, self.scratch["inp_values_p"], one_const))
             self._emit("flow", ("add_imm", addr1, self.scratch["inp_values_p"], VLEN))
             n_pairs = len(vec_blocks) // 2
             for pair_idx in range(n_pairs):
@@ -854,7 +861,6 @@ class KernelBuilder:
             self.free_temp(addr0, 1)
             self.free_temp(addr1, 1)
 
-        tail = batch_size - tail_start
         if tail:
             addr_idx = self.alloc_temp(1)
             addr_val = self.alloc_temp(1)
