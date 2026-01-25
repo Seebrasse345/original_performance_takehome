@@ -2,3 +2,6 @@ trace.json
 **/*.pyc
 .hypothesis
 .DS_Store
+perf_takehome_submit.py
+submit_kernel.py
+perf_takehome_backup.py
